@@ -2,13 +2,10 @@ package main
 
 import (
 	"context"
-	"crypto/subtle"
-	"encoding/binary"
 	"encoding/json"
 	"errors"
 	"flag"
 	"fmt"
-	"io"
 	"log"
 	"net"
 	"os"
@@ -155,249 +152,27 @@ func loadConfig(path string) (config, error) {
 			if _, _, e := net.SplitHostPort(t.TargetAddr); e != nil {
 				return c, e
 			}
-			if t.Network == proto.NetworkTCP {
+			switch t.Network {
+			case proto.NetworkTCP:
 				if tcp[t.PublicPort] {
 					return c, fmt.Errorf("duplicate TCP port %d", t.PublicPort)
 				}
 				tcp[t.PublicPort] = true
-			} else if t.Network == proto.NetworkUDP {
+			case proto.NetworkUDP:
 				if udp[t.PublicPort] {
 					return c, fmt.Errorf("duplicate UDP port %d", t.PublicPort)
 				}
 				udp[t.PublicPort] = true
-			} else if t.Network == proto.NetworkBoth {
+			case proto.NetworkBoth:
 				if tcp[t.PublicPort] || udp[t.PublicPort] {
 					return c, fmt.Errorf("duplicate both port %d", t.PublicPort)
 				}
 
 				tcp[t.PublicPort], udp[t.PublicPort] = true, true
-			} else {
+			default:
 				return c, errors.New("network must be tcp, udp, or both")
 			}
 		}
 	}
 	return c, nil
-}
-
-func (s *relayServer) handleAgent(ctx context.Context, conn *quic.Conn) {
-	control, err := conn.AcceptStream(ctx)
-	if err != nil {
-		return
-	}
-
-	dec, enc := json.NewDecoder(control), json.NewEncoder(control)
-	var m proto.Message
-	if err := dec.Decode(&m); err != nil {
-		return
-	}
-
-	ac, ok := s.auth(m)
-	if !ok {
-		_ = enc.Encode(proto.Message{Type: proto.MsgError, Reason: "authentication failed"})
-		return
-	}
-
-	a := &agent{id: ac.ID, conn: conn}
-	if err = s.register(a, ac.Tunnels); err != nil {
-		_ = enc.Encode(proto.Message{Type: proto.MsgError, Reason: err.Error()})
-		return
-	}
-
-	defer s.remove(a)
-	if err := enc.Encode(proto.Message{Type: proto.MsgRegistered, Mappings: ac.Tunnels, RelayPublicAddr: s.cfg.PublicAddr}); err != nil {
-		return
-	}
-
-	go s.fromAgentUDP(ctx, a)
-	for {
-		var msg proto.Message
-		_ = control.SetReadDeadline(time.Now().Add(45 * time.Second))
-
-		if dec.Decode(&msg) != nil {
-			return
-		}
-		if msg.Type == proto.MsgPing {
-			if enc.Encode(proto.Message{Type: proto.MsgPong}) != nil {
-				return
-			}
-		}
-	}
-}
-
-func (s *relayServer) auth(m proto.Message) (agentConfig, bool) {
-	if m.Type != proto.MsgRegister {
-		return agentConfig{}, false
-	}
-	for _, a := range s.cfg.Agents {
-		if a.ID == m.AgentID && subtle.ConstantTimeCompare([]byte(a.Token), []byte(m.Token)) == 1 {
-			return a, true
-		}
-	}
-	return agentConfig{}, false
-}
-
-func (s *relayServer) register(a *agent, ts []proto.Mapping) error {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	for _, t := range ts {
-		if t.Network == proto.NetworkTCP || t.Network == proto.NetworkBoth {
-			if s.tcp[t.PublicPort] != nil {
-				return fmt.Errorf("TCP port %d active", t.PublicPort)
-			}
-		}
-		if t.Network == proto.NetworkUDP || t.Network == proto.NetworkBoth {
-			if s.udp[t.PublicPort] != nil {
-				return fmt.Errorf("UDP port %d active", t.PublicPort)
-			}
-		}
-	}
-	for _, t := range ts {
-		if t.Network == proto.NetworkTCP || t.Network == proto.NetworkBoth {
-			ln, e := net.Listen("tcp", fmt.Sprintf(":%d", t.PublicPort))
-			if e != nil {
-				s.removeLocked(a)
-				return e
-			}
-			r := &tcpRelay{t.PublicPort, a, ln}
-			s.tcp[t.PublicPort] = r
-			go s.acceptTCP(r)
-		}
-		if t.Network == proto.NetworkUDP || t.Network == proto.NetworkBoth {
-			c, e := net.ListenUDP("udp", &net.UDPAddr{Port: int(t.PublicPort)})
-			if e != nil {
-				s.removeLocked(a)
-				return e
-			}
-			r := &udpRelay{port: t.PublicPort, agent: a, conn: c, flows: map[string]*udpFlow{}, byID: map[uint64]*udpFlow{}}
-			s.udp[t.PublicPort] = r
-			go s.acceptUDP(r)
-		}
-	}
-	return nil
-}
-
-func (s *relayServer) acceptTCP(r *tcpRelay) {
-	for {
-		c, e := r.ln.Accept()
-		if e != nil {
-			return
-		}
-		go relayTCP(c, r.agent.conn, r.port)
-	}
-}
-
-func relayTCP(c net.Conn, q *quic.Conn, p uint16) {
-	defer c.Close()
-	st, e := q.OpenStreamSync(context.Background())
-	if e != nil {
-		return
-	}
-
-	defer st.Close()
-	if err := binary.Write(st, binary.BigEndian, p); err != nil {
-		st.CancelWrite(1)
-		return
-	}
-
-	done := make(chan struct{})
-	go func() {
-		if _, err := io.Copy(st, c); err != nil {
-			st.CancelWrite(1)
-		} else {
-			_ = st.Close()
-		}
-		close(done)
-	}()
-	if _, err := io.Copy(c, st); err != nil {
-		st.CancelRead(1)
-	}
-
-	<-done
-}
-
-func (s *relayServer) acceptUDP(r *udpRelay) {
-	b := make([]byte, 65535)
-	for {
-		n, a, e := r.conn.ReadFromUDP(b)
-		if e != nil {
-			return
-		}
-		flowID := r.flowID(a)
-		d, e := proto.MarshalUDPDatagram(r.port, flowID, b[:n])
-		if e == nil {
-			_ = r.agent.conn.SendDatagram(d)
-		}
-	}
-}
-
-func (s *relayServer) fromAgentUDP(ctx context.Context, a *agent) {
-	for {
-		d, e := a.conn.ReceiveDatagram(ctx)
-		if e != nil {
-			return
-		}
-		p, flowID, pay, e := proto.UnmarshalUDPDatagram(d)
-		if e != nil {
-			continue
-		}
-		s.mu.Lock()
-		r := s.udp[p]
-		s.mu.Unlock()
-		if r == nil || r.agent != a {
-			continue
-		}
-		r.mu.Lock()
-		r.pruneFlowsLocked()
-		flow := r.byID[flowID]
-		if flow != nil {
-			flow.lastSeen = time.Now()
-		}
-		r.mu.Unlock()
-		if flow != nil {
-			_, _ = r.conn.WriteToUDP(pay, flow.address)
-		}
-	}
-}
-
-func (r *udpRelay) flowID(address *net.UDPAddr) uint64 {
-	key := address.String()
-	r.mu.Lock()
-	defer r.mu.Unlock()
-	r.pruneFlowsLocked()
-	if flow := r.flows[key]; flow != nil {
-		flow.lastSeen = time.Now()
-		return flow.id
-	}
-
-	r.nextFlowID++
-	flow := &udpFlow{id: r.nextFlowID, address: address, lastSeen: time.Now()}
-	r.flows[key], r.byID[flow.id] = flow, flow
-	return flow.id
-}
-
-func (r *udpRelay) pruneFlowsLocked() {
-	deadline := time.Now().Add(-2 * time.Minute)
-	for key, flow := range r.flows {
-		if flow.lastSeen.Before(deadline) {
-			delete(r.flows, key)
-			delete(r.byID, flow.id)
-		}
-	}
-}
-
-func (s *relayServer) remove(a *agent) { s.mu.Lock(); defer s.mu.Unlock(); s.removeLocked(a) }
-
-func (s *relayServer) removeLocked(a *agent) {
-	for p, r := range s.tcp {
-		if r.agent == a {
-			_ = r.ln.Close()
-			delete(s.tcp, p)
-		}
-	}
-	for p, r := range s.udp {
-		if r.agent == a {
-			_ = r.conn.Close()
-			delete(s.udp, p)
-		}
-	}
 }

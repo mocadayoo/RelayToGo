@@ -11,8 +11,9 @@ import (
 
 func GenerateTLSConfig() (*tls.Config, error) {
 	key, err := rsa.GenerateKey(rand.Reader, 2048)
-	if err != nil { return nil, err }
-
+	if err != nil {
+		return nil, err
+	}
 
 	template := x509.Certificate{
 		SerialNumber: big.NewInt(1),
@@ -37,8 +38,9 @@ func GenerateTLSConfig() (*tls.Config, error) {
 		&key.PublicKey,
 		key,
 	)
-	if err != nil { return nil, err }
-
+	if err != nil {
+		return nil, err
+	}
 
 	cert := tls.Certificate{
 		Certificate: [][]byte{certDER},

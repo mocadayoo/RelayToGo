@@ -22,6 +22,7 @@ const (
 	MsgError      MessageType = "error"
 	MsgPing       MessageType = "ping"
 	MsgPong       MessageType = "pong"
+	MsgClose      MessageType = "close"
 )
 
 type Mapping struct {
