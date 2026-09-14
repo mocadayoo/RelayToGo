@@ -1,0 +1,198 @@
+<!doctype html>
+<html lang="ja">
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>RelayToGo</title>
+<style>
+    :root {
+        color: #1d1d1f;
+        background: #fff;
+        font-family: -apple-system, BlinkMacSystemFont, "SF Pro Text", "Helvetica Neue", sans-serif
+    }
+
+    * {
+        box-sizing: border-box
+    }
+
+    body {
+        margin: 0
+    }
+
+    main {
+        max-width: 920px;
+        margin: 0 auto;
+        padding: 72px 24px
+    }
+
+    header {
+        margin-bottom: 52px
+    }
+
+    h1 {
+        font-size: 32px;
+        letter-spacing: -.8px;
+        margin: 0 0 8px
+    }
+
+    .sub {
+        color: #6e6e73;
+        font-size: 17px;
+        margin: 0
+    }
+
+    .card {
+        border-top: 1px solid #d2d2d7;
+        padding: 24px 0
+    }
+
+    h2 {
+        font-size: 20px;
+        letter-spacing: -.25px;
+        margin: 0 0 20px
+    }
+
+    form {
+        display: grid;
+        grid-template-columns: 1fr 150px 1.4fr auto;
+        gap: 12px;
+        align-items: end
+    }
+
+    label {
+        display: grid;
+        gap: 7px;
+        color: #6e6e73;
+        font-size: 13px
+    }
+
+    input,
+    select,
+    button {
+        appearance: none;
+        border: 1px solid #d2d2d7;
+        border-radius: 10px;
+        background: #fff;
+        color: #1d1d1f;
+        font: inherit;
+        padding: 10px 12px
+    }
+
+    input:focus,
+    select:focus {
+        border-color: #0071e3;
+        outline: 3px solid #0071e31f
+    }
+
+    button {
+        background: #0071e3;
+        border-color: #0071e3;
+        color: #fff;
+        cursor: pointer;
+        padding: 10px 16px
+    }
+
+    button.delete {
+        background: transparent;
+        border-color: transparent;
+        color: #d70015;
+        padding: 6px 0
+    }
+
+    button:hover {
+        opacity: .78
+    }
+
+    table {
+        border-collapse: collapse;
+        width: 100%
+    }
+
+    th,
+    td {
+        border-bottom: 1px solid #e5e5ea;
+        padding: 14px 8px;
+        text-align: left
+    }
+
+    th {
+        color: #6e6e73;
+        font-size: 12px;
+        font-weight: 500
+    }
+
+    td {
+        font-size: 14px
+    }
+
+    code {
+        font-family: "SF Mono", Menlo, monospace;
+        font-size: 12px
+    }
+
+    .notice {
+        color: #d70015;
+        font-size: 14px;
+        min-height: 20px;
+        margin-top: 14px
+    }
+
+    .empty {
+        color: #6e6e73;
+        padding: 12px 0
+    }
+
+    @media(max-width:700px) {
+        main {
+            padding: 44px 20px
+        }
+
+        form {
+            grid-template-columns: 1fr 1fr
+        }
+
+        form label:last-of-type {
+            grid-column: 1/-1
+        }
+
+        th:nth-child(5),
+        td:nth-child(5),
+        th:nth-child(6),
+        td:nth-child(6) {
+            display: none
+        }
+    }
+</style>
+<main>
+    <header>
+        <h1>RelayToGo</h1>
+        <p class="sub">この agent のトンネルを管理します · <span id="public">接続中…</span></p>
+    </header>
+    <section class="card">
+        <h2>トンネルを追加</h2>
+        <form id="add">
+            <label>名前<input name="name" required placeholder="Web"></label>
+            <label>プロトコル<select name="network">
+                    <option value="tcp">TCP</option>
+                    <option value="udp">UDP</option>
+                    <option value="both">TCP + UDP</option>
+                </select></label>
+            <label>転送先<input name="target_addr" required placeholder="127.0.0.1:8080"></label>
+            <button>追加</button>
+        </form>
+        <div class="notice" id="notice"></div>
+    </section>
+    <section class="card">
+        <h2>トンネル</h2>
+        <div id="list"></div>
+    </section>
+</main>
+<script>
+    const $ = s => document.querySelector(s), escape = s => String(s).replace(/[&<>"']/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
+    async function api(u, o) { const r = await fetch(u, o); if (!r.ok) { let x = {}; try { x = await r.json() } catch { } throw Error(x.error || r.statusText) } return r.status === 204 ? null : r.json() }
+    const bytes = n => n < 1024 ? n + ' B' : n < 1048576 ? (n / 1024).toFixed(1) + ' KB' : (n / 1048576).toFixed(1) + ' MB';
+    async function load() { try { const [s, ts] = await Promise.all([api('/api/status'), api('/api/tunnels')]); $('#public').textContent = s.relay_public_addr || '不明'; $('#list').innerHTML = ts.length ? '<table><thead><tr><th>名前</th><th>種類</th><th>公開ポート</th><th>転送先</th><th>受信 / 送信</th><th>接続数</th><th></th></tr></thead><tbody>' + ts.map(t => '<tr><td>' + escape(t.name) + '</td><td>' + escape(t.network) + '</td><td><code>' + t.public_port + '</code></td><td><code>' + escape(t.target_addr) + '</code></td><td>' + bytes(t.in) + ' / ' + bytes(t.out) + '</td><td>' + t.clients + '</td><td><button class="delete" data-id="' + escape(t.id) + '">削除</button></td></tr>').join('') + '</tbody></table>' : '<div class="empty">トンネルはまだありません。</div>' } catch (e) { $('#notice').textContent = e.message } }
+    $('#add').onsubmit = async e => { e.preventDefault(); const f = Object.fromEntries(new FormData(e.target)); $('#notice').textContent = '追加中…'; try { const t = await api('/api/tunnels', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(f) }); e.target.reset(); $('#notice').textContent = '公開ポート ' + t.public_port + ' を割り当てました。'; await load() } catch (err) { $('#notice').textContent = err.message } };
+    $('#list').onclick = async e => { const id = e.target.dataset.id; if (!id || !confirm('このトンネルを削除しますか？')) return; try { await api('/api/tunnels/' + encodeURIComponent(id), { method: 'DELETE' }); await load() } catch (err) { $('#notice').textContent = err.message } }; load(); setInterval(load, 5000);
+</script>
+
+</html>

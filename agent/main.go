@@ -5,7 +5,6 @@ import (
 	"crypto/tls"
 	"encoding/json"
 	"flag"
-	"fmt"
 	"log"
 	"net"
 	"os"
@@ -26,6 +25,8 @@ type udpSession struct {
 	flowID uint64
 }
 
+const agentUIAddr = "127.0.0.1:41002"
+
 type relayAgent struct {
 	conn            *quic.Conn
 	relayPublicAddr string
@@ -35,6 +36,9 @@ type relayAgent struct {
 	stats           map[string]*tunnelStats
 	mu              sync.Mutex
 	sessions        map[string]*udpSession
+	control         *controlWriter
+	pending         map[string]chan proto.Message
+	requestSeq      atomic.Uint64
 	lastPong        atomic.Int64
 }
 
@@ -77,25 +81,18 @@ func main() {
 		log.Fatalf("registration rejected: %s", reply.Reason)
 	}
 
-	a := &relayAgent{conn: q, relayPublicAddr: reply.RelayPublicAddr, tcp: map[uint16]string{}, udp: map[uint16]string{}, tunnels: map[string]proto.Mapping{}, stats: map[string]*tunnelStats{}, sessions: map[string]*udpSession{}}
+	a := &relayAgent{conn: q, relayPublicAddr: reply.RelayPublicAddr, tcp: map[uint16]string{}, udp: map[uint16]string{}, tunnels: map[string]proto.Mapping{}, stats: map[string]*tunnelStats{}, sessions: map[string]*udpSession{}, pending: map[string]chan proto.Message{}}
 	for _, t := range reply.Mappings {
-		key := string(t.Network) + fmt.Sprintf(":%d", t.PublicPort)
-		a.tunnels[key] = t
-		a.stats[key] = &tunnelStats{}
-		switch t.Network {
-		case proto.NetworkTCP:
-			a.tcp[t.PublicPort] = t.TargetAddr
-		case proto.NetworkUDP:
-			a.udp[t.PublicPort] = t.TargetAddr
-		case proto.NetworkBoth:
-			a.tcp[t.PublicPort] = t.TargetAddr
-			a.udp[t.PublicPort] = t.TargetAddr
-		}
+		a.addTunnel(t)
 	}
 	a.lastPong.Store(time.Now().UnixNano())
+	writer := &controlWriter{enc: enc}
+	a.control = writer
 	go a.runPanel(ctx)
+	go a.serveUI(agentUIAddr)
 	go a.receiveUDP(ctx)
-	go a.heartbeat(ctx, control, enc, dec)
+	go a.controlLoop(ctx, dec, writer)
+	go a.heartbeat(ctx, control, writer)
 	log.Printf("attached: %d tunnel(s)", len(reply.Mappings))
 	for {
 		st, err := q.AcceptStream(ctx)

@@ -3,7 +3,6 @@ package main
 import (
 	"context"
 	"encoding/binary"
-	"encoding/json"
 	"fmt"
 	"io"
 	"net"
@@ -59,27 +58,7 @@ func (a *relayAgent) handleTCP(st *quic.Stream) {
 	<-done
 }
 
-func (a *relayAgent) heartbeat(ctx context.Context, control *quic.Stream, enc *json.Encoder, dec *json.Decoder) {
-	pongs := make(chan struct{}, 1)
-	go func() {
-		for {
-			var message proto.Message
-			if err := dec.Decode(&message); err != nil {
-				return
-			}
-
-			if message.Type != proto.MsgPong {
-				continue
-			}
-
-			a.lastPong.Store(time.Now().UnixNano())
-			select {
-			case pongs <- struct{}{}:
-			default:
-			}
-		}
-	}()
-
+func (a *relayAgent) heartbeat(ctx context.Context, control *quic.Stream, writer *controlWriter) {
 	ticker := time.NewTicker(15 * time.Second)
 	defer ticker.Stop()
 	for {
@@ -87,13 +66,10 @@ func (a *relayAgent) heartbeat(ctx context.Context, control *quic.Stream, enc *j
 		case <-ctx.Done():
 			return
 		case <-ticker.C:
-			if err := enc.Encode(proto.Message{Type: proto.MsgPing}); err != nil {
+			if err := writer.send(proto.Message{Type: proto.MsgPing}); err != nil {
 				return
 			}
-
-			select {
-			case <-pongs:
-			case <-time.After(10 * time.Second):
+			if time.Since(time.Unix(0, a.lastPong.Load())) > 25*time.Second {
 				_ = control.Close()
 				return
 			}

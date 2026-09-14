@@ -21,9 +21,17 @@ import (
 )
 
 type config struct {
-	QUICAddr   string        `json:"quic_addr"`
-	PublicAddr string        `json:"public_addr"`
-	Agents     []agentConfig `json:"agents"`
+	QUICAddr        string        `json:"quic_addr"`
+	PublicAddr      string        `json:"public_addr"`
+	APIAddr         string        `json:"api_addr"`
+	APIToken        string        `json:"api_token"`
+	PublicPortRange portRange     `json:"public_port_range"`
+	Agents          []agentConfig `json:"agents"`
+}
+
+type portRange struct {
+	Start uint16 `json:"start"`
+	End   uint16 `json:"end"`
 }
 
 type agentConfig struct {
@@ -33,8 +41,9 @@ type agentConfig struct {
 }
 
 type agent struct {
-	id   string
-	conn *quic.Conn
+	id       string
+	conn     *quic.Conn
+	outbound chan proto.Message
 }
 
 type tcpRelay struct {
@@ -60,14 +69,17 @@ type udpFlow struct {
 }
 
 type relayServer struct {
-	mu  sync.Mutex
-	cfg config
-	tcp map[uint16]*tcpRelay
-	udp map[uint16]*udpRelay
+	mu     sync.Mutex
+	cfg    config
+	path   string
+	agents map[string]*agent
+	tcp    map[uint16]*tcpRelay
+	udp    map[uint16]*udpRelay
 }
 
 func main() {
 	path := flag.String("config", "server/config.json", "server configuration")
+	api := flag.String("api", "127.0.0.1:41001", "management API address")
 	flag.Parse()
 	cfg, err := loadConfig(*path)
 	if err != nil {
@@ -99,7 +111,11 @@ func main() {
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 
-	s := &relayServer{cfg: cfg, tcp: map[uint16]*tcpRelay{}, udp: map[uint16]*udpRelay{}}
+	if cfg.APIAddr == "" {
+		cfg.APIAddr = *api
+	}
+	s := &relayServer{cfg: cfg, path: *path, agents: map[string]*agent{}, tcp: map[uint16]*tcpRelay{}, udp: map[uint16]*udpRelay{}}
+	go s.serveAPI(cfg.APIAddr)
 	for {
 		conn, err := ln.Accept(ctx)
 		if err != nil {
@@ -129,6 +145,10 @@ func loadConfig(path string) (config, error) {
 	}
 	if c.PublicAddr == "" {
 		return c, errors.New("public_addr is required")
+	}
+	if (c.PublicPortRange.Start == 0) != (c.PublicPortRange.End == 0) ||
+		(c.PublicPortRange.Start != 0 && c.PublicPortRange.Start > c.PublicPortRange.End) {
+		return c, errors.New("public_port_range must contain an ordered start and end")
 	}
 
 	ids := map[string]bool{}

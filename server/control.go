@@ -4,6 +4,7 @@ import (
 	"context"
 	"crypto/subtle"
 	"encoding/json"
+	"log"
 	"time"
 
 	proto "RelayToGo/protocol"
@@ -29,14 +30,20 @@ func (s *relayServer) handleAgent(ctx context.Context, conn *quic.Conn) {
 		return
 	}
 
-	a := &agent{id: ac.ID, conn: conn}
+	a := &agent{id: ac.ID, conn: conn, outbound: make(chan proto.Message, 32)}
+	go a.sendLoop(enc)
+
 	if err = s.register(a, ac.Tunnels); err != nil {
 		_ = enc.Encode(proto.Message{Type: proto.MsgError, Reason: err.Error()})
 		return
 	}
 
+	s.mu.Lock()
+	s.agents[a.id] = a
+	s.mu.Unlock()
+
 	defer s.remove(a)
-	if err := enc.Encode(proto.Message{Type: proto.MsgRegistered, Mappings: ac.Tunnels, RelayPublicAddr: s.cfg.PublicAddr}); err != nil {
+	if !a.send(proto.Message{Type: proto.MsgRegistered, Mappings: ac.Tunnels, RelayPublicAddr: s.cfg.PublicAddr}) {
 		return
 	}
 
@@ -50,13 +57,63 @@ func (s *relayServer) handleAgent(ctx context.Context, conn *quic.Conn) {
 		}
 		switch msg.Type {
 		case proto.MsgPing:
-			if enc.Encode(proto.Message{Type: proto.MsgPong}) != nil {
+			if !a.send(proto.Message{Type: proto.MsgPong}) {
 				return
 			}
 		case proto.MsgClose:
 			return
+		case proto.MsgTunnelAck:
+			log.Printf("agent %s acknowledged tunnel %s: %s", a.id, msg.TunnelID, msg.Reason)
+		case proto.MsgTunnelCreate:
+			if msg.Tunnel == nil {
+				_ = a.send(proto.Message{Type: proto.MsgTunnelResult, RequestID: msg.RequestID, Reason: "missing tunnel"})
+				continue
+			}
+			tunnel, err := s.createTunnel(a.id, *msg.Tunnel)
+			if err != nil {
+				_ = a.send(proto.Message{Type: proto.MsgTunnelResult, RequestID: msg.RequestID, Reason: err.Error()})
+				continue
+			}
+			_ = a.send(proto.Message{Type: proto.MsgTunnelResult, RequestID: msg.RequestID, Tunnel: &tunnel, TunnelID: tunnel.ID})
+		case proto.MsgTunnelDelete:
+			deleted, err := s.deleteTunnelForAgent(a.id, msg.TunnelID)
+			result := proto.Message{Type: proto.MsgTunnelResult, RequestID: msg.RequestID, TunnelID: msg.TunnelID}
+			if err != nil {
+				result.Reason = err.Error()
+			} else if !deleted {
+				result.Reason = "tunnel not found"
+			}
+			_ = a.send(result)
 		}
 	}
+}
+
+func (a *agent) send(message proto.Message) bool {
+	select {
+	case a.outbound <- message:
+		return true
+	default:
+		return false
+	}
+}
+
+func (a *agent) sendLoop(enc *json.Encoder) {
+	for message := range a.outbound {
+		if err := enc.Encode(message); err != nil {
+			return
+		}
+	}
+}
+
+func (s *relayServer) notifyTunnelAdd(agentID string, tunnel proto.Mapping) bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	agent := s.agents[agentID]
+	if agent == nil {
+		return false
+	}
+
+	return agent.send(proto.Message{Type: proto.MsgTunnelAdd, Tunnel: &tunnel, TunnelID: tunnel.ID})
 }
 
 func (s *relayServer) auth(m proto.Message) (agentConfig, bool) {

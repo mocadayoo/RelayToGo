@@ -38,26 +38,39 @@ func (s *relayServer) register(a *agent, ts []proto.Mapping) error {
 		switch t.Network {
 		case proto.NetworkTCP:
 			if err := s.openTCP(a, t); err != nil {
-				s.removeLocked(a)
+				s.rollbackMappingsLocked(a, ts)
 				return err
 			}
 		case proto.NetworkUDP:
 			if err := s.openUDP(a, t); err != nil {
-				s.removeLocked(a)
+				s.rollbackMappingsLocked(a, ts)
 				return err
 			}
 		case proto.NetworkBoth:
 			if err := s.openTCP(a, t); err != nil {
-				s.removeLocked(a)
+				s.rollbackMappingsLocked(a, ts)
 				return err
 			}
 			if err := s.openUDP(a, t); err != nil {
-				s.removeLocked(a)
+				s.rollbackMappingsLocked(a, ts)
 				return err
 			}
 		}
 	}
 	return nil
+}
+
+func (s *relayServer) rollbackMappingsLocked(a *agent, tunnels []proto.Mapping) {
+	for _, t := range tunnels {
+		if r := s.tcp[t.PublicPort]; r != nil && r.agent == a {
+			_ = r.ln.Close()
+			delete(s.tcp, t.PublicPort)
+		}
+		if r := s.udp[t.PublicPort]; r != nil && r.agent == a {
+			_ = r.conn.Close()
+			delete(s.udp, t.PublicPort)
+		}
+	}
 }
 
 func (s *relayServer) openTCP(a *agent, t proto.Mapping) error {
@@ -195,7 +208,63 @@ func (r *udpRelay) pruneFlowsLocked() {
 
 func (s *relayServer) remove(a *agent) { s.mu.Lock(); defer s.mu.Unlock(); s.removeLocked(a) }
 
+func (s *relayServer) deleteTunnel(id string) (bool, error) {
+	s.mu.Lock()
+	for i := range s.cfg.Agents {
+		for _, t := range s.cfg.Agents[i].Tunnels {
+			if t.ID == id {
+				agentID := s.cfg.Agents[i].ID
+				s.mu.Unlock()
+				return s.deleteTunnelForAgent(agentID, id)
+			}
+		}
+	}
+	s.mu.Unlock()
+	return false, nil
+}
+
+func (s *relayServer) deleteTunnelForAgent(agentID, id string) (bool, error) {
+	s.mu.Lock()
+	var tunnel proto.Mapping
+	found := false
+	for i := range s.cfg.Agents {
+		if s.cfg.Agents[i].ID != agentID {
+			continue
+		}
+		for j, t := range s.cfg.Agents[i].Tunnels {
+			if t.ID != id {
+				continue
+			}
+			tunnel, found = t, true
+			s.cfg.Agents[i].Tunnels = append(s.cfg.Agents[i].Tunnels[:j], s.cfg.Agents[i].Tunnels[j+1:]...)
+			break
+		}
+	}
+	if !found {
+		s.mu.Unlock()
+		return false, nil
+	}
+	if r := s.tcp[tunnel.PublicPort]; r != nil {
+		_ = r.ln.Close()
+		delete(s.tcp, tunnel.PublicPort)
+	}
+	if r := s.udp[tunnel.PublicPort]; r != nil {
+		_ = r.conn.Close()
+		delete(s.udp, tunnel.PublicPort)
+	}
+	if a := s.agents[agentID]; a != nil {
+		_ = a.send(proto.Message{Type: proto.MsgTunnelRemove, TunnelID: id})
+	}
+	s.mu.Unlock()
+	if err := s.saveConfig(); err != nil {
+		return true, err
+	}
+	return true, nil
+}
+
 func (s *relayServer) removeLocked(a *agent) {
+	delete(s.agents, a.id)
+
 	for p, r := range s.tcp {
 		if r.agent == a {
 			_ = r.ln.Close()

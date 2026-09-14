@@ -23,6 +23,13 @@ const (
 	MsgPing       MessageType = "ping"
 	MsgPong       MessageType = "pong"
 	MsgClose      MessageType = "close"
+
+	MsgTunnelAdd    MessageType = "tunnel_add"
+	MsgTunnelRemove MessageType = "tunnel_remove"
+	MsgTunnelAck    MessageType = "tunnel_ack"
+	MsgTunnelCreate MessageType = "tunnel_create"
+	MsgTunnelDelete MessageType = "tunnel_delete"
+	MsgTunnelResult MessageType = "tunnel_result"
 )
 
 type Mapping struct {
@@ -38,6 +45,9 @@ type Message struct {
 	AgentID         string      `json:"agent_id,omitempty"`
 	Token           string      `json:"token,omitempty"`
 	Mappings        []Mapping   `json:"mappings,omitempty"`
+	Tunnel          *Mapping    `json:"tunnel,omitempty"`
+	TunnelID        string      `json:"tunnel_id,omitempty"`
+	RequestID       string      `json:"request_id,omitempty"`
 	RelayPublicAddr string      `json:"relay_public_addr,omitempty"`
 	MappingID       uint32      `json:"mapping_id,omitempty"`
 	Reason          string      `json:"reason,omitempty"`
