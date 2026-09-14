@@ -10,6 +10,7 @@ type Network string
 const (
 	NetworkTCP Network = "tcp"
 	NetworkUDP Network = "udp"
+	NetworkBoth Network = "both"
 )
 
 type MessageType string

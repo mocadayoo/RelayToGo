@@ -153,8 +153,12 @@ func loadConfig(path string) (config, error) {
 					return c, fmt.Errorf("duplicate UDP port %d", t.PublicPort)
 				}
 				udp[t.PublicPort] = true
+			} else if t.Network == proto.NetworkBoth {
+				if tcp[t.PublicPort] || udp[t.PublicPort] { return c, fmt.Errorf("duplicate both port %d", t.PublicPort) }
+
+				tcp[t.PublicPort], udp[t.PublicPort] = true, true
 			} else {
-				return c, errors.New("network must be tcp or udp")
+				return c, errors.New("network must be tcp, udp, or both")
 			}
 		}
 	}
@@ -222,16 +226,19 @@ func (s *relayServer) register(a *agent, ts []proto.Mapping) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	for _, t := range ts {
-		if t.Network == proto.NetworkTCP {
+		if t.Network == proto.NetworkTCP || t.Network == proto.NetworkBoth {
 			if s.tcp[t.PublicPort] != nil {
 				return fmt.Errorf("TCP port %d active", t.PublicPort)
 			}
-		} else if s.udp[t.PublicPort] != nil {
+		}
+		if t.Network == proto.NetworkUDP || t.Network == proto.NetworkBoth {
+			if s.udp[t.PublicPort] != nil {
 			return fmt.Errorf("UDP port %d active", t.PublicPort)
+			}
 		}
 	}
 	for _, t := range ts {
-		if t.Network == proto.NetworkTCP {
+		if t.Network == proto.NetworkTCP || t.Network == proto.NetworkBoth {
 			ln, e := net.Listen("tcp", fmt.Sprintf(":%d", t.PublicPort))
 			if e != nil {
 				s.removeLocked(a)
@@ -240,7 +247,8 @@ func (s *relayServer) register(a *agent, ts []proto.Mapping) error {
 			r := &tcpRelay{t.PublicPort, a, ln}
 			s.tcp[t.PublicPort] = r
 			go s.acceptTCP(r)
-		} else {
+		}
+		if t.Network == proto.NetworkUDP || t.Network == proto.NetworkBoth {
 			c, e := net.ListenUDP("udp", &net.UDPAddr{Port: int(t.PublicPort)})
 			if e != nil {
 				s.removeLocked(a)

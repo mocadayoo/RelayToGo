@@ -84,9 +84,10 @@ func main() {
 		key := string(t.Network) + fmt.Sprintf(":%d", t.PublicPort)
 		a.tunnels[key] = t
 		a.stats[key] = &tunnelStats{}
-		if t.Network == proto.NetworkTCP {
+		if t.Network == proto.NetworkTCP || t.Network == proto.NetworkBoth {
 			a.tcp[t.PublicPort] = t.TargetAddr
-		} else {
+		}
+		if t.Network == proto.NetworkUDP || t.Network == proto.NetworkBoth {
 			a.udp[t.PublicPort] = t.TargetAddr
 		}
 	}

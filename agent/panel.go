@@ -42,7 +42,9 @@ func (r countedReader) Read(p []byte) (int, error) {
 }
 
 func (a *relayAgent) statsFor(network proto.Network, port uint16) *tunnelStats {
-	return a.stats[string(network)+fmt.Sprintf(":%d", port)]
+	if stats := a.stats[string(network)+fmt.Sprintf(":%d", port)]; stats != nil { return stats }
+
+	return a.stats[string(proto.NetworkBoth)+fmt.Sprintf(":%d", port)]
 }
 
 func (a *relayAgent) runPanel(ctx context.Context) {
