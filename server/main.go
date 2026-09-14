@@ -139,7 +139,14 @@ func loadConfig(path string) (config, error) {
 		}
 		ids[a.ID] = true
 		tunnelNames := map[string]bool{}
+		tunnelIDs := map[string]bool{}
 		for _, t := range a.Tunnels {
+			if t.ID == "" || tunnelIDs[t.ID] {
+				return c, fmt.Errorf("agent %s tunnel IDs must be unique", a.ID)
+			}
+
+			tunnelIDs[t.ID] = true
+
 			if t.Name == "" || tunnelNames[t.Name] {
 				return c, fmt.Errorf("agent %s tunnel names must be unique", a.ID)
 			}

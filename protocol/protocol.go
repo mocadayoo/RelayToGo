@@ -26,6 +26,7 @@ const (
 )
 
 type Mapping struct {
+	ID         string  `json:"id"`
 	Name       string  `json:"name"`
 	Network    Network `json:"network"`
 	PublicPort uint16  `json:"public_port"`
