@@ -131,7 +131,12 @@ func loadConfig(path string) (config, error) {
 			return c, errors.New("agent id and token must be unique")
 		}
 		ids[a.ID] = true
+		tunnelNames := map[string]bool{}
 		for _, t := range a.Tunnels {
+			if t.Name == "" || tunnelNames[t.Name] { return c, fmt.Errorf("agent %s tunnel names must be unique", a.ID) }
+
+			tunnelNames[t.Name] = true
+
 			if t.PublicPort == 0 {
 				return c, errors.New("public_port is required")
 			}

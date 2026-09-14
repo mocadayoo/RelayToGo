@@ -68,13 +68,13 @@ func (a *relayAgent) printPanel() {
 	for _, key := range keys {
 		t := a.tunnels[key]
 		in, out, clients := a.statsFor(t.Network, t.PublicPort).snapshot()
-		fmt.Fprintf(os.Stdout, "%s  %s <-> %s:%d\n", t.Network, t.TargetAddr, a.relayPublicAddr, t.PublicPort)
+		fmt.Fprintf(os.Stdout, "[%s] %s  %s <-> %s:%d\n", t.Name, t.Network, t.TargetAddr, a.relayPublicAddr, t.PublicPort)
 		fmt.Fprintf(os.Stdout, "  IN: %-8s OUT: %-8s Clients: %d\n", formatBytes(in), formatBytes(out), clients)
 	}
 }
 
 func formatBytes(n uint64) string {
-	units := []string{"B", "KB", "MB", "GB"}
+	units := []string{"B", "KB", "MB", "GB", "TB"}
 	value := float64(n)
 	i := 0
 	for value >= 1024 && i < len(units)-1 {
