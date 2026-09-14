@@ -42,8 +42,6 @@ type Mapping struct {
 
 type Message struct {
 	Type            MessageType `json:"type"`
-	AgentID         string      `json:"agent_id,omitempty"`
-	Token           string      `json:"token,omitempty"`
 	Mappings        []Mapping   `json:"mappings,omitempty"`
 	Tunnel          *Mapping    `json:"tunnel,omitempty"`
 	TunnelID        string      `json:"tunnel_id,omitempty"`

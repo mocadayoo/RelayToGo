@@ -2,7 +2,6 @@ package main
 
 import (
 	"context"
-	"crypto/tls"
 	"encoding/json"
 	"flag"
 	"log"
@@ -44,19 +43,18 @@ type relayAgent struct {
 
 func main() {
 	server := flag.String("server", "127.0.0.1:40000", "server QUIC address")
-	id := flag.String("id", "", "agent identifier")
-	token := flag.String("token", "", "agent token")
 	flag.Parse()
-	if *id == "" || *token == "" {
-		log.Fatal("-id and -token are required")
+	_, tlsConfig, publicKey, err := loadAgentTLS()
+	if publicKey != "" {
+		log.Printf("agent public key SHA-256: %s", publicKey)
+	}
+	if err != nil {
+		log.Fatal(err)
 	}
 
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
-	q, err := quic.DialAddr(ctx, *server, &tls.Config{
-		InsecureSkipVerify: true,
-		NextProtos:         []string{"RelayToGo"},
-	}, &quic.Config{EnableDatagrams: true})
+	q, err := quic.DialAddr(ctx, *server, tlsConfig, &quic.Config{EnableDatagrams: true})
 	if err != nil {
 		log.Fatal(err)
 	}
@@ -68,7 +66,7 @@ func main() {
 	}
 
 	enc, dec := json.NewEncoder(control), json.NewDecoder(control)
-	if err := enc.Encode(proto.Message{Type: proto.MsgRegister, AgentID: *id, Token: *token}); err != nil {
+	if err := enc.Encode(proto.Message{Type: proto.MsgRegister}); err != nil {
 		log.Fatal("send registration")
 	}
 

@@ -2,7 +2,6 @@ package main
 
 import (
 	"context"
-	"crypto/subtle"
 	"encoding/json"
 	"log"
 	"time"
@@ -24,7 +23,7 @@ func (s *relayServer) handleAgent(ctx context.Context, conn *quic.Conn) {
 		return
 	}
 
-	ac, ok := s.auth(m)
+	ac, ok := s.auth(m, conn)
 	if !ok {
 		_ = enc.Encode(proto.Message{Type: proto.MsgError, Reason: "authentication failed"})
 		return
@@ -116,16 +115,17 @@ func (s *relayServer) notifyTunnelAdd(agentID string, tunnel proto.Mapping) bool
 	return agent.send(proto.Message{Type: proto.MsgTunnelAdd, Tunnel: &tunnel, TunnelID: tunnel.ID})
 }
 
-func (s *relayServer) auth(m proto.Message) (agentConfig, bool) {
-	switch m.Type {
-	case proto.MsgRegister:
-	default:
+func (s *relayServer) auth(m proto.Message, conn *quic.Conn) (agentConfig, bool) {
+	if m.Type != proto.MsgRegister {
 		return agentConfig{}, false
 	}
-	for _, a := range s.cfg.Agents {
-		if a.ID == m.AgentID && subtle.ConstantTimeCompare([]byte(a.Token), []byte(m.Token)) == 1 {
-			return a, true
-		}
+	state := conn.ConnectionState().TLS
+	if len(state.PeerCertificates) != 1 {
+		return agentConfig{}, false
 	}
-	return agentConfig{}, false
+	fingerprint, err := certificateFingerprint(state.PeerCertificates[0].Raw)
+	if err != nil {
+		return agentConfig{}, false
+	}
+	return s.agentByFingerprint(fingerprint)
 }

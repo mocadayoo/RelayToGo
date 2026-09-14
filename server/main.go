@@ -16,7 +16,6 @@ import (
 	"time"
 
 	proto "RelayToGo/protocol"
-	temp "RelayToGo/temp"
 
 	"github.com/quic-go/quic-go"
 )
@@ -36,9 +35,9 @@ type portRange struct {
 }
 
 type agentConfig struct {
-	ID      string          `json:"id"`
-	Token   string          `json:"token"`
-	Tunnels []proto.Mapping `json:"-"`
+	ID              string          `json:"id"`
+	PublicKeySHA256 string          `json:"public_key_sha256"`
+	Tunnels         []proto.Mapping `json:"-"`
 }
 
 type agentSecrets struct {
@@ -83,12 +82,13 @@ type udpFlow struct {
 }
 
 type relayServer struct {
-	mu       sync.Mutex
-	cfg      config
-	dataPath string
-	agents   map[string]*agent
-	tcp      map[uint16]*tcpRelay
-	udp      map[uint16]*udpRelay
+	mu         sync.Mutex
+	cfg        config
+	agentsPath string
+	dataPath   string
+	agents     map[string]*agent
+	tcp        map[uint16]*tcpRelay
+	udp        map[uint16]*udpRelay
 }
 
 func main() {
@@ -107,11 +107,12 @@ func main() {
 	if err := loadTunnelData(dataPath, &cfg); err != nil {
 		log.Fatal(err)
 	}
-
-	tlsConf, err := temp.GenerateTLSConfig()
+	s := &relayServer{cfg: cfg, agentsPath: filepath.Join(secretDir, "agents.json"), dataPath: dataPath, agents: map[string]*agent{}, tcp: map[uint16]*tcpRelay{}, udp: map[uint16]*udpRelay{}}
+	tlsConf, serverFingerprint, err := loadOrCreateServerTLS(secretDir, s.hasAgentKey)
 	if err != nil {
 		log.Fatal(err)
 	}
+	log.Printf("server public key SHA-256: %s", serverFingerprint)
 
 	addr, err := net.ResolveUDPAddr("udp", cfg.QUICAddr)
 	if err != nil {
@@ -136,8 +137,8 @@ func main() {
 	if cfg.APIAddr == "" {
 		cfg.APIAddr = *api
 	}
-	s := &relayServer{cfg: cfg, dataPath: dataPath, agents: map[string]*agent{}, tcp: map[uint16]*tcpRelay{}, udp: map[uint16]*udpRelay{}}
 	go s.serveAPI(cfg.APIAddr)
+	go s.readConsole(ctx.Done())
 	for {
 		conn, err := ln.Accept(ctx)
 		if err != nil {
@@ -178,6 +179,21 @@ func loadConfig(path string) (config, error) {
 
 func loadAgentSecrets(path string, c *config) error {
 	data, err := os.ReadFile(path)
+	if errors.Is(err, os.ErrNotExist) {
+		if err := os.MkdirAll(filepath.Dir(path), 0700); err != nil {
+			return err
+		}
+		data, err = json.MarshalIndent(agentSecrets{Agents: []agentConfig{}}, "", "  ")
+		if err != nil {
+			return err
+		}
+		if err := os.WriteFile(path, data, 0600); err != nil {
+			return err
+		}
+		log.Printf("created %s; type add <agent-id> <public-key-sha256> in this terminal", path)
+		c.Agents = nil
+		return nil
+	}
 	if err != nil {
 		return err
 	}
@@ -192,8 +208,8 @@ func loadAgentSecrets(path string, c *config) error {
 func validateAgentSecrets(agents []agentConfig) error {
 	ids := map[string]bool{}
 	for _, a := range agents {
-		if a.ID == "" || a.Token == "" || ids[a.ID] {
-			return errors.New("agent id and token must be unique")
+		if a.ID == "" || ids[a.ID] {
+			return errors.New("agent IDs must be unique")
 		}
 		ids[a.ID] = true
 	}
@@ -203,6 +219,17 @@ func validateAgentSecrets(agents []agentConfig) error {
 func loadTunnelData(path string, c *config) error {
 	data, err := os.ReadFile(path)
 	if errors.Is(err, os.ErrNotExist) {
+		if err := os.MkdirAll(filepath.Dir(path), 0700); err != nil {
+			return err
+		}
+		data, err := json.MarshalIndent(tunnelData{Agents: []agentTunnelData{}}, "", "  ")
+		if err != nil {
+			return err
+		}
+		if err := os.WriteFile(path, data, 0600); err != nil {
+			return err
+		}
+		log.Printf("created %s", path)
 		return nil
 	}
 	if err != nil {
