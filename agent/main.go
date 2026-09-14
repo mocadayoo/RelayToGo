@@ -25,7 +25,7 @@ import (
 type udpSession struct {
 	conn   *net.UDPConn
 	port   uint16
-	remote string
+	flowID uint64
 }
 
 type relayAgent struct {
@@ -120,6 +120,8 @@ func (a *relayAgent) handleTCP(st *quic.Stream) {
 
 	local, err := net.Dial("tcp", target)
 	if err != nil {
+		st.CancelRead(1)
+		st.CancelWrite(1)
 		return
 	}
 
@@ -130,11 +132,22 @@ func (a *relayAgent) handleTCP(st *quic.Stream) {
 
 	done := make(chan struct{})
 	go func() {
-		_, _ = io.Copy(local, countedReader{Reader: st, count: stats.addIn})
-		_ = local.Close()
+		if _, err := io.Copy(local, countedReader{Reader: st, count: stats.addIn}); err != nil {
+			st.CancelRead(1)
+		}
+
+		if tcp, ok := local.(*net.TCPConn); ok {
+			_ = tcp.CloseWrite()
+		}
+
 		close(done)
 	}()
-	_, _ = io.Copy(st, countedReader{Reader: local, count: stats.addOut})
+	if _, err := io.Copy(st, countedReader{Reader: local, count: stats.addOut}); err != nil {
+		st.CancelWrite(1)
+	} else {
+		_ = st.Close()
+	}
+
 	<-done
 }
 
@@ -187,19 +200,19 @@ func (a *relayAgent) receiveUDP(ctx context.Context) {
 			return
 		}
 
-		p, remote, payload, err := proto.UnmarshalUDPDatagram(d)
+		p, flowID, payload, err := proto.UnmarshalUDPDatagram(d)
 		if err != nil || a.udp[p] == "" {
 			continue
 		}
 
-		a.toLocalUDP(p, remote, payload)
+		a.toLocalUDP(p, flowID, payload)
 	}
 }
 
-func (a *relayAgent) toLocalUDP(port uint16, remote string, payload []byte) {
+func (a *relayAgent) toLocalUDP(port uint16, flowID uint64, payload []byte) {
 	a.statsFor(proto.NetworkUDP, port).addIn(len(payload))
 
-	key := string(rune(port)) + "|" + remote
+	key := fmt.Sprintf("%d:%d", port, flowID)
 	a.mu.Lock()
 	s := a.sessions[key]
 	if s == nil {
@@ -207,7 +220,7 @@ func (a *relayAgent) toLocalUDP(port uint16, remote string, payload []byte) {
 		if e == nil {
 			c, e := net.DialUDP("udp", nil, target)
 			if e == nil {
-				s = &udpSession{c, port, remote}
+				s = &udpSession{conn: c, port: port, flowID: flowID}
 				a.sessions[key] = s
 				a.statsFor(proto.NetworkUDP, port).addClient(1)
 				go a.fromLocalUDP(key, s)
@@ -236,7 +249,7 @@ func (a *relayAgent) fromLocalUDP(key string, s *udpSession) {
 			return
 		}
 
-		d, e := proto.MarshalUDPDatagram(s.port, s.remote, b[:n])
+		d, e := proto.MarshalUDPDatagram(s.port, s.flowID, b[:n])
 		if e == nil {
 			a.statsFor(proto.NetworkUDP, s.port).addOut(n)
 			_ = a.conn.SendDatagram(d)

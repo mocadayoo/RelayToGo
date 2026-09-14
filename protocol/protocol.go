@@ -8,8 +8,8 @@ import (
 type Network string
 
 const (
-	NetworkTCP Network = "tcp"
-	NetworkUDP Network = "udp"
+	NetworkTCP  Network = "tcp"
+	NetworkUDP  Network = "udp"
 	NetworkBoth Network = "both"
 )
 
@@ -41,33 +41,22 @@ type Message struct {
 	Reason          string      `json:"reason,omitempty"`
 }
 
-func MarshalUDPDatagram(port uint16, address string, payload []byte) ([]byte, error) {
-	if len(address) > 0xffff {
-		return nil, fmt.Errorf("address is too long")
-	}
-
-	packet := make([]byte, 4+len(address)+len(payload))
+func MarshalUDPDatagram(port uint16, flowID uint64, payload []byte) ([]byte, error) {
+	packet := make([]byte, 10+len(payload))
 	binary.BigEndian.PutUint16(packet[:2], port)
-	binary.BigEndian.PutUint16(packet[2:4], uint16(len(address)))
-	copy(packet[4:], address)
-	copy(packet[4+len(address):], payload)
+	binary.BigEndian.PutUint64(packet[2:10], flowID)
+	copy(packet[10:], payload)
 	return packet, nil
 }
 
-func UnmarshalUDPDatagram(packet []byte) (port uint16, address string, payload []byte, err error) {
-	if len(packet) < 4 {
+func UnmarshalUDPDatagram(packet []byte) (port uint16, flowID uint64, payload []byte, err error) {
+	if len(packet) < 10 {
 		err = fmt.Errorf("UDP datagram header is truncated")
 		return
 	}
 
 	port = binary.BigEndian.Uint16(packet[:2])
-	addrLen := int(binary.BigEndian.Uint16(packet[2:4]))
-	if len(packet) < 4+addrLen {
-		err = fmt.Errorf("UDP datagram address is truncated")
-		return
-	}
-
-	address = string(packet[4 : 4+addrLen])
-	payload = packet[4+addrLen:]
+	flowID = binary.BigEndian.Uint64(packet[2:10])
+	payload = packet[10:]
 	return
 }

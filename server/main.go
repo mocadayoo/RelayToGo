@@ -47,9 +47,19 @@ type tcpRelay struct {
 }
 
 type udpRelay struct {
-	port  uint16
-	agent *agent
-	conn  *net.UDPConn
+	port       uint16
+	agent      *agent
+	conn       *net.UDPConn
+	mu         sync.Mutex
+	nextFlowID uint64
+	flows      map[string]*udpFlow
+	byID       map[uint64]*udpFlow
+}
+
+type udpFlow struct {
+	id       uint64
+	address  *net.UDPAddr
+	lastSeen time.Time
 }
 
 type relayServer struct {
@@ -133,7 +143,9 @@ func loadConfig(path string) (config, error) {
 		ids[a.ID] = true
 		tunnelNames := map[string]bool{}
 		for _, t := range a.Tunnels {
-			if t.Name == "" || tunnelNames[t.Name] { return c, fmt.Errorf("agent %s tunnel names must be unique", a.ID) }
+			if t.Name == "" || tunnelNames[t.Name] {
+				return c, fmt.Errorf("agent %s tunnel names must be unique", a.ID)
+			}
 
 			tunnelNames[t.Name] = true
 
@@ -154,7 +166,9 @@ func loadConfig(path string) (config, error) {
 				}
 				udp[t.PublicPort] = true
 			} else if t.Network == proto.NetworkBoth {
-				if tcp[t.PublicPort] || udp[t.PublicPort] { return c, fmt.Errorf("duplicate both port %d", t.PublicPort) }
+				if tcp[t.PublicPort] || udp[t.PublicPort] {
+					return c, fmt.Errorf("duplicate both port %d", t.PublicPort)
+				}
 
 				tcp[t.PublicPort], udp[t.PublicPort] = true, true
 			} else {
@@ -233,7 +247,7 @@ func (s *relayServer) register(a *agent, ts []proto.Mapping) error {
 		}
 		if t.Network == proto.NetworkUDP || t.Network == proto.NetworkBoth {
 			if s.udp[t.PublicPort] != nil {
-			return fmt.Errorf("UDP port %d active", t.PublicPort)
+				return fmt.Errorf("UDP port %d active", t.PublicPort)
 			}
 		}
 	}
@@ -254,7 +268,7 @@ func (s *relayServer) register(a *agent, ts []proto.Mapping) error {
 				s.removeLocked(a)
 				return e
 			}
-			r := &udpRelay{t.PublicPort, a, c}
+			r := &udpRelay{port: t.PublicPort, agent: a, conn: c, flows: map[string]*udpFlow{}, byID: map[uint64]*udpFlow{}}
 			s.udp[t.PublicPort] = r
 			go s.acceptUDP(r)
 		}
@@ -278,13 +292,26 @@ func relayTCP(c net.Conn, q *quic.Conn, p uint16) {
 	if e != nil {
 		return
 	}
+
 	defer st.Close()
-	if binary.Write(st, binary.BigEndian, p) != nil {
+	if err := binary.Write(st, binary.BigEndian, p); err != nil {
+		st.CancelWrite(1)
 		return
 	}
+
 	done := make(chan struct{})
-	go func() { _, _ = io.Copy(st, c); _ = st.Close(); close(done) }()
-	_, _ = io.Copy(c, st)
+	go func() {
+		if _, err := io.Copy(st, c); err != nil {
+			st.CancelWrite(1)
+		} else {
+			_ = st.Close()
+		}
+		close(done)
+	}()
+	if _, err := io.Copy(c, st); err != nil {
+		st.CancelRead(1)
+	}
+
 	<-done
 }
 
@@ -295,7 +322,8 @@ func (s *relayServer) acceptUDP(r *udpRelay) {
 		if e != nil {
 			return
 		}
-		d, e := proto.MarshalUDPDatagram(r.port, a.String(), b[:n])
+		flowID := r.flowID(a)
+		d, e := proto.MarshalUDPDatagram(r.port, flowID, b[:n])
 		if e == nil {
 			_ = r.agent.conn.SendDatagram(d)
 		}
@@ -308,7 +336,7 @@ func (s *relayServer) fromAgentUDP(ctx context.Context, a *agent) {
 		if e != nil {
 			return
 		}
-		p, addr, pay, e := proto.UnmarshalUDPDatagram(d)
+		p, flowID, pay, e := proto.UnmarshalUDPDatagram(d)
 		if e != nil {
 			continue
 		}
@@ -318,9 +346,41 @@ func (s *relayServer) fromAgentUDP(ctx context.Context, a *agent) {
 		if r == nil || r.agent != a {
 			continue
 		}
-		remote, e := net.ResolveUDPAddr("udp", addr)
-		if e == nil {
-			_, _ = r.conn.WriteToUDP(pay, remote)
+		r.mu.Lock()
+		r.pruneFlowsLocked()
+		flow := r.byID[flowID]
+		if flow != nil {
+			flow.lastSeen = time.Now()
+		}
+		r.mu.Unlock()
+		if flow != nil {
+			_, _ = r.conn.WriteToUDP(pay, flow.address)
+		}
+	}
+}
+
+func (r *udpRelay) flowID(address *net.UDPAddr) uint64 {
+	key := address.String()
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.pruneFlowsLocked()
+	if flow := r.flows[key]; flow != nil {
+		flow.lastSeen = time.Now()
+		return flow.id
+	}
+
+	r.nextFlowID++
+	flow := &udpFlow{id: r.nextFlowID, address: address, lastSeen: time.Now()}
+	r.flows[key], r.byID[flow.id] = flow, flow
+	return flow.id
+}
+
+func (r *udpRelay) pruneFlowsLocked() {
+	deadline := time.Now().Add(-2 * time.Minute)
+	for key, flow := range r.flows {
+		if flow.lastSeen.Before(deadline) {
+			delete(r.flows, key)
+			delete(r.byID, flow.id)
 		}
 	}
 }
