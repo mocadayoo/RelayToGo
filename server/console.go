@@ -41,6 +41,9 @@ func (s *relayServer) readConsole(ctxDone <-chan struct{}) {
 			log.Print("unknown command; type help")
 		}
 	}
+	if err := scanner.Err(); err != nil {
+		log.Printf("terminal input: %v", err)
+	}
 }
 
 func (s *relayServer) printAgents() {
