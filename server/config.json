@@ -1,0 +1,10 @@
+{
+  "quic_addr": ":40000",
+  "public_addr": "127.0.0.1",
+  "api_addr": "127.0.0.1:41001",
+  "api_token": "",
+  "public_port_range": {
+    "start": 10000,
+    "end": 20000
+  }
+}

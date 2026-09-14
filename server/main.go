@@ -10,6 +10,7 @@ import (
 	"net"
 	"os"
 	"os/signal"
+	"path/filepath"
 	"sync"
 	"syscall"
 	"time"
@@ -37,6 +38,19 @@ type portRange struct {
 type agentConfig struct {
 	ID      string          `json:"id"`
 	Token   string          `json:"token"`
+	Tunnels []proto.Mapping `json:"-"`
+}
+
+type agentSecrets struct {
+	Agents []agentConfig `json:"agents"`
+}
+
+type tunnelData struct {
+	Agents []agentTunnelData `json:"agents"`
+}
+
+type agentTunnelData struct {
+	ID      string          `json:"id"`
 	Tunnels []proto.Mapping `json:"tunnels"`
 }
 
@@ -69,12 +83,12 @@ type udpFlow struct {
 }
 
 type relayServer struct {
-	mu     sync.Mutex
-	cfg    config
-	path   string
-	agents map[string]*agent
-	tcp    map[uint16]*tcpRelay
-	udp    map[uint16]*udpRelay
+	mu       sync.Mutex
+	cfg      config
+	dataPath string
+	agents   map[string]*agent
+	tcp      map[uint16]*tcpRelay
+	udp      map[uint16]*udpRelay
 }
 
 func main() {
@@ -83,6 +97,14 @@ func main() {
 	flag.Parse()
 	cfg, err := loadConfig(*path)
 	if err != nil {
+		log.Fatal(err)
+	}
+	secretDir := filepath.Join(filepath.Dir(*path), "secret")
+	if err := loadAgentSecrets(filepath.Join(secretDir, "agents.json"), &cfg); err != nil {
+		log.Fatal(err)
+	}
+	dataPath := filepath.Join(secretDir, "data.json")
+	if err := loadTunnelData(dataPath, &cfg); err != nil {
 		log.Fatal(err)
 	}
 
@@ -114,7 +136,7 @@ func main() {
 	if cfg.APIAddr == "" {
 		cfg.APIAddr = *api
 	}
-	s := &relayServer{cfg: cfg, path: *path, agents: map[string]*agent{}, tcp: map[uint16]*tcpRelay{}, udp: map[uint16]*udpRelay{}}
+	s := &relayServer{cfg: cfg, dataPath: dataPath, agents: map[string]*agent{}, tcp: map[uint16]*tcpRelay{}, udp: map[uint16]*udpRelay{}}
 	go s.serveAPI(cfg.APIAddr)
 	for {
 		conn, err := ln.Accept(ctx)
@@ -151,55 +173,106 @@ func loadConfig(path string) (config, error) {
 		return c, errors.New("public_port_range must contain an ordered start and end")
 	}
 
+	return c, nil
+}
+
+func loadAgentSecrets(path string, c *config) error {
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return err
+	}
+	var secrets agentSecrets
+	if err := json.Unmarshal(data, &secrets); err != nil {
+		return err
+	}
+	c.Agents = secrets.Agents
+	return validateAgentSecrets(c.Agents)
+}
+
+func validateAgentSecrets(agents []agentConfig) error {
 	ids := map[string]bool{}
-	tcp, udp := map[uint16]bool{}, map[uint16]bool{}
-	for _, a := range c.Agents {
+	for _, a := range agents {
 		if a.ID == "" || a.Token == "" || ids[a.ID] {
-			return c, errors.New("agent id and token must be unique")
+			return errors.New("agent id and token must be unique")
 		}
 		ids[a.ID] = true
+	}
+	return nil
+}
+
+func loadTunnelData(path string, c *config) error {
+	data, err := os.ReadFile(path)
+	if errors.Is(err, os.ErrNotExist) {
+		return nil
+	}
+	if err != nil {
+		return err
+	}
+	var stored tunnelData
+	if err := json.Unmarshal(data, &stored); err != nil {
+		return err
+	}
+	indexes := make(map[string]int, len(c.Agents))
+	for i, agent := range c.Agents {
+		indexes[agent.ID] = i
+	}
+	seen := map[string]bool{}
+	for _, agent := range stored.Agents {
+		index, ok := indexes[agent.ID]
+		if !ok || seen[agent.ID] {
+			return fmt.Errorf("data contains an unknown or duplicate agent %q", agent.ID)
+		}
+		seen[agent.ID] = true
+		c.Agents[index].Tunnels = agent.Tunnels
+	}
+	return validateConfiguredTunnels(*c)
+}
+
+func validateConfiguredTunnels(c config) error {
+	tcp, udp := map[uint16]bool{}, map[uint16]bool{}
+	for _, a := range c.Agents {
 		tunnelNames := map[string]bool{}
 		tunnelIDs := map[string]bool{}
 		for _, t := range a.Tunnels {
 			if t.ID == "" || tunnelIDs[t.ID] {
-				return c, fmt.Errorf("agent %s tunnel IDs must be unique", a.ID)
+				return fmt.Errorf("agent %s tunnel IDs must be unique", a.ID)
 			}
 
 			tunnelIDs[t.ID] = true
 
 			if t.Name == "" || tunnelNames[t.Name] {
-				return c, fmt.Errorf("agent %s tunnel names must be unique", a.ID)
+				return fmt.Errorf("agent %s tunnel names must be unique", a.ID)
 			}
 
 			tunnelNames[t.Name] = true
 
 			if t.PublicPort == 0 {
-				return c, errors.New("public_port is required")
+				return errors.New("public_port is required")
 			}
 			if _, _, e := net.SplitHostPort(t.TargetAddr); e != nil {
-				return c, e
+				return e
 			}
 			switch t.Network {
 			case proto.NetworkTCP:
 				if tcp[t.PublicPort] {
-					return c, fmt.Errorf("duplicate TCP port %d", t.PublicPort)
+					return fmt.Errorf("duplicate TCP port %d", t.PublicPort)
 				}
 				tcp[t.PublicPort] = true
 			case proto.NetworkUDP:
 				if udp[t.PublicPort] {
-					return c, fmt.Errorf("duplicate UDP port %d", t.PublicPort)
+					return fmt.Errorf("duplicate UDP port %d", t.PublicPort)
 				}
 				udp[t.PublicPort] = true
 			case proto.NetworkBoth:
 				if tcp[t.PublicPort] || udp[t.PublicPort] {
-					return c, fmt.Errorf("duplicate both port %d", t.PublicPort)
+					return fmt.Errorf("duplicate both port %d", t.PublicPort)
 				}
 
 				tcp[t.PublicPort], udp[t.PublicPort] = true, true
 			default:
-				return c, errors.New("network must be tcp, udp, or both")
+				return errors.New("network must be tcp, udp, or both")
 			}
 		}
 	}
-	return c, nil
+	return nil
 }

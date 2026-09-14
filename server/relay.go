@@ -256,7 +256,7 @@ func (s *relayServer) deleteTunnelForAgent(agentID, id string) (bool, error) {
 		_ = a.send(proto.Message{Type: proto.MsgTunnelRemove, TunnelID: id})
 	}
 	s.mu.Unlock()
-	if err := s.saveConfig(); err != nil {
+	if err := s.saveData(); err != nil {
 		return true, err
 	}
 	return true, nil

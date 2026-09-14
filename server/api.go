@@ -120,7 +120,7 @@ func (s *relayServer) createTunnel(agentID string, tunnel proto.Mapping) (proto.
 		}
 	}
 	s.mu.Unlock()
-	if err := s.saveConfig(); err != nil {
+	if err := s.saveData(); err != nil {
 		return proto.Mapping{}, err
 	}
 	return tunnel, nil
@@ -187,18 +187,25 @@ func (s *relayServer) portReservedByConfig(port uint16) bool {
 	}
 	return false
 }
-func (s *relayServer) saveConfig() error {
+func (s *relayServer) saveData() error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	data, err := json.MarshalIndent(s.cfg, "", "  ")
+	stored := tunnelData{Agents: make([]agentTunnelData, 0, len(s.cfg.Agents))}
+	for _, agent := range s.cfg.Agents {
+		if len(agent.Tunnels) == 0 {
+			continue
+		}
+		stored.Agents = append(stored.Agents, agentTunnelData{ID: agent.ID, Tunnels: agent.Tunnels})
+	}
+	data, err := json.MarshalIndent(stored, "", "  ")
 	if err != nil {
 		return err
 	}
-	temp := s.path + ".tmp"
+	temp := s.dataPath + ".tmp"
 	if err := os.WriteFile(temp, data, 0600); err != nil {
 		return err
 	}
-	return os.Rename(temp, s.path)
+	return os.Rename(temp, s.dataPath)
 }
 func newTunnelID() string {
 	b := make([]byte, 12)
