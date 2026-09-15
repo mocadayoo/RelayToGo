@@ -17,6 +17,11 @@ import (
 
 const relaySetupTimeout = 10 * time.Second
 
+const (
+	udpSessionIdleTimeout = 2 * time.Minute
+	udpSessionRetryDelay = 5 * time.Second
+)
+
 var udpBuffers = sync.Pool{New: func() any { return make([]byte, 65535) }}
 
 func (a *relayAgent) handleTCP(st *quic.Stream) {
@@ -109,7 +114,13 @@ func (a *relayAgent) receiveUDP(ctx context.Context) {
 
 func (a *relayAgent) toLocalUDP(port uint16, mappingID, flowID uint64, payload []byte) {
 	key := udpSessionKey{port: port, mappingID: mappingID, flowID: flowID}
+	now := time.Now()
 	a.mu.Lock()
+	tunnel, exists := a.udp[port]
+	if !exists || tunnel.MappingID != mappingID {
+		a.mu.Unlock()
+		return
+	}
 	stats := a.statsForLocked(proto.NetworkUDP, port)
 	if stats == nil {
 		a.mu.Unlock()
@@ -117,37 +128,77 @@ func (a *relayAgent) toLocalUDP(port uint16, mappingID, flowID uint64, payload [
 	}
 	stats.addIn(len(payload))
 	s := a.sessions[key]
-	if s == nil {
-		tunnel, exists := a.udp[port]
-		if !exists || tunnel.MappingID != mappingID {
-			a.mu.Unlock()
-			return
+	if s != nil {
+		a.mu.Unlock()
+		a.writeLocalUDP(s, payload)
+		return
+	}
+	if retryAt, failed := a.retryAfter[key]; failed && now.Before(retryAt) {
+		stats.addDrop()
+		a.mu.Unlock()
+		return
+	}
+	delete(a.retryAfter, key)
+	if _, pending := a.pendingSessions[key]; pending {
+		stats.addDrop()
+		a.mu.Unlock()
+		return
+	}
+	a.pendingSessions[key] = struct{}{}
+	targetAddr := tunnel.TargetAddr
+	a.mu.Unlock()
+
+	dialCtx, cancel := context.WithTimeout(context.Background(), relaySetupTimeout)
+	rawConn, err := (&net.Dialer{}).DialContext(dialCtx, "udp", targetAddr)
+	cancel()
+	var conn *net.UDPConn
+	if err == nil {
+		var ok bool
+		conn, ok = rawConn.(*net.UDPConn)
+		if !ok {
+			_ = rawConn.Close()
+			err = errors.New("UDP dial returned a non-UDP connection")
 		}
-		target, e := net.ResolveUDPAddr("udp", tunnel.TargetAddr)
-		if e == nil {
-			c, e := net.DialUDP("udp", nil, target)
-			if e == nil {
-				s = &udpSession{conn: c, port: port, mappingID: mappingID, flowID: flowID, stats: stats}
-				a.sessions[key] = s
-				stats.addClient(1)
-				go a.fromLocalUDP(key, s)
-			}
+	}
+
+	a.mu.Lock()
+	delete(a.pendingSessions, key)
+	current, stillMapped := a.udp[port]
+	if err != nil || !stillMapped || current.MappingID != mappingID {
+		if err != nil && stillMapped && current.MappingID == mappingID {
+			a.retryAfter[key] = time.Now().Add(udpSessionRetryDelay)
+			stats.addDrop()
 		}
+		a.mu.Unlock()
+		if conn != nil {
+			_ = conn.Close()
+		}
+		return
+	}
+	if s = a.sessions[key]; s == nil {
+		s = &udpSession{conn: conn, port: port, mappingID: mappingID, flowID: flowID, stats: stats}
+		a.sessions[key] = s
+		stats.addClient(1)
+		go a.fromLocalUDP(key, s)
+	} else {
+		_ = conn.Close()
 	}
 	a.mu.Unlock()
-	if s != nil {
-		// Keep the session alive for client-to-target traffic too. Without this,
-		// one-way UDP traffic expires even while the public client is active.
-		_ = s.conn.SetReadDeadline(time.Now().Add(2 * time.Minute))
-		_, _ = s.conn.Write(payload)
-	}
+	a.writeLocalUDP(s, payload)
+}
+
+func (a *relayAgent) writeLocalUDP(s *udpSession, payload []byte) {
+	// Keep the session alive for client-to-target traffic too. Without this,
+	// one-way UDP traffic expires even while the public client is active.
+	_ = s.conn.SetReadDeadline(time.Now().Add(udpSessionIdleTimeout))
+	_, _ = s.conn.Write(payload)
 }
 
 func (a *relayAgent) fromLocalUDP(key udpSessionKey, s *udpSession) {
 	b := udpBuffers.Get().([]byte)
 	defer udpBuffers.Put(b)
 	for {
-		s.conn.SetReadDeadline(time.Now().Add(2 * time.Minute))
+		s.conn.SetReadDeadline(time.Now().Add(udpSessionIdleTimeout))
 		n, e := s.conn.Read(b)
 		if e != nil {
 			a.mu.Lock()
@@ -164,6 +215,25 @@ func (a *relayAgent) fromLocalUDP(key udpSessionKey, s *udpSession) {
 		if e == nil {
 			s.stats.addOut(n)
 			a.sendUDPDatagram(s, d)
+		}
+	}
+}
+
+func (a *relayAgent) pruneUDPFailures(ctx context.Context) {
+	ticker := time.NewTicker(30 * time.Second)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case now := <-ticker.C:
+			a.mu.Lock()
+			for key, retryAt := range a.retryAfter {
+				if !retryAt.After(now) {
+					delete(a.retryAfter, key)
+				}
+			}
+			a.mu.Unlock()
 		}
 	}
 }

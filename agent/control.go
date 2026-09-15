@@ -146,6 +146,16 @@ func (a *relayAgent) removeTunnel(id string) {
 		_ = session.conn.Close()
 		session.stats.addClient(-1)
 	}
+	for key := range a.pendingSessions {
+		if key.port == tunnel.PublicPort && key.mappingID == tunnel.MappingID {
+			delete(a.pendingSessions, key)
+		}
+	}
+	for key := range a.retryAfter {
+		if key.port == tunnel.PublicPort && key.mappingID == tunnel.MappingID {
+			delete(a.retryAfter, key)
+		}
+	}
 	delete(a.tunnels, id)
 	delete(a.stats, tunnelKey(tunnel.Network, tunnel.PublicPort))
 	if (tunnel.Network == proto.NetworkTCP || tunnel.Network == proto.NetworkBoth) && a.tcp[tunnel.PublicPort].MappingID == tunnel.MappingID {

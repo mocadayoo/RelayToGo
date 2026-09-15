@@ -43,6 +43,8 @@ type relayAgent struct {
 	stats           map[string]*tunnelStats
 	mu              sync.Mutex
 	sessions        map[udpSessionKey]*udpSession
+	pendingSessions map[udpSessionKey]struct{}
+	retryAfter      map[udpSessionKey]time.Time
 	control         *controlWriter
 	pending         map[string]chan proto.Message
 	requestSeq      atomic.Uint64
@@ -89,7 +91,7 @@ func main() {
 		log.Fatalf("registration rejected: %s", reply.Reason)
 	}
 
-	a := &relayAgent{conn: q, relayPublicAddr: reply.RelayPublicAddr, tcp: map[uint16]proto.Mapping{}, udp: map[uint16]proto.Mapping{}, tunnels: map[string]proto.Mapping{}, stats: map[string]*tunnelStats{}, sessions: map[udpSessionKey]*udpSession{}, pending: map[string]chan proto.Message{}}
+	a := &relayAgent{conn: q, relayPublicAddr: reply.RelayPublicAddr, tcp: map[uint16]proto.Mapping{}, udp: map[uint16]proto.Mapping{}, tunnels: map[string]proto.Mapping{}, stats: map[string]*tunnelStats{}, sessions: map[udpSessionKey]*udpSession{}, pendingSessions: map[udpSessionKey]struct{}{}, retryAfter: map[udpSessionKey]time.Time{}, pending: map[string]chan proto.Message{}}
 	for _, t := range reply.Mappings {
 		a.addTunnel(t)
 	}
@@ -98,6 +100,7 @@ func main() {
 	a.control = writer
 	go a.serveUI(agentUIAddr)
 	go a.receiveUDP(ctx)
+	go a.pruneUDPFailures(ctx)
 	go a.controlLoop(ctx, dec, writer)
 	go a.heartbeat(ctx, writer)
 	log.Printf("attached: %d tunnel(s)", len(reply.Mappings))
