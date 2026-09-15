@@ -119,7 +119,7 @@ func (a *relayAgent) removeTunnel(id string) {
 	}
 
 	for key, session := range a.sessions {
-		if session.port != tunnel.PublicPort {
+		if session.port != tunnel.PublicPort || session.mappingID != tunnel.MappingID {
 			continue
 		}
 		delete(a.sessions, key)
@@ -128,8 +128,12 @@ func (a *relayAgent) removeTunnel(id string) {
 	}
 	delete(a.tunnels, id)
 	delete(a.stats, tunnelKey(tunnel.Network, tunnel.PublicPort))
-	delete(a.tcp, tunnel.PublicPort)
-	delete(a.udp, tunnel.PublicPort)
+	if (tunnel.Network == proto.NetworkTCP || tunnel.Network == proto.NetworkBoth) && a.tcp[tunnel.PublicPort].MappingID == tunnel.MappingID {
+		delete(a.tcp, tunnel.PublicPort)
+	}
+	if (tunnel.Network == proto.NetworkUDP || tunnel.Network == proto.NetworkBoth) && a.udp[tunnel.PublicPort].MappingID == tunnel.MappingID {
+		delete(a.udp, tunnel.PublicPort)
+	}
 }
 
 func tunnelKey(network proto.Network, port uint16) string {

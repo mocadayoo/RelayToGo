@@ -100,7 +100,7 @@ func (a *agent) enqueueOperation(msg proto.Message) {
 		return
 	case a.operations <- msg:
 	default:
-		_ = a.send(proto.Message{Type: proto.MsgTunnelResult, RequestID: msg.RequestID, TunnelID: msg.TunnelID, Reason: "too many pending tunnel operations"})
+		_ = a.trySend(proto.Message{Type: proto.MsgTunnelResult, RequestID: msg.RequestID, TunnelID: msg.TunnelID, Reason: "too many pending tunnel operations"})
 	}
 }
 
@@ -150,6 +150,17 @@ func (a *agent) send(message proto.Message) bool {
 		return false
 	case a.outbound <- message:
 		return true
+	}
+}
+
+func (a *agent) trySend(message proto.Message) bool {
+	select {
+	case <-a.done:
+		return false
+	case a.outbound <- message:
+		return true
+	default:
+		return false
 	}
 }
 

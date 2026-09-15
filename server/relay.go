@@ -63,16 +63,26 @@ func (s *relayServer) register(a *agent, ts []proto.Mapping) error {
 
 func (s *relayServer) rollbackMappingsLocked(a *agent, tunnels []proto.Mapping) {
 	for _, t := range tunnels {
-		if r := s.tcp[t.PublicPort]; r != nil && r.agent == a {
+		if (t.Network == proto.NetworkTCP || t.Network == proto.NetworkBoth) && matchingTCPRelay(s.tcp[t.PublicPort], a, t.MappingID) {
+			r := s.tcp[t.PublicPort]
 			r.close()
 			delete(s.tcp, t.PublicPort)
 		}
-		if r := s.udp[t.PublicPort]; r != nil && r.agent == a {
+		if (t.Network == proto.NetworkUDP || t.Network == proto.NetworkBoth) && matchingUDPRelay(s.udp[t.PublicPort], a, t.MappingID) {
+			r := s.udp[t.PublicPort]
 			r.close()
 			delete(s.udp, t.PublicPort)
 		}
 	}
 	s.publishUDPSnapshotLocked()
+}
+
+func matchingTCPRelay(r *tcpRelay, a *agent, mappingID uint64) bool {
+	return r != nil && r.agent == a && r.tunnel.MappingID == mappingID
+}
+
+func matchingUDPRelay(r *udpRelay, a *agent, mappingID uint64) bool {
+	return r != nil && r.agent == a && r.tunnel.MappingID == mappingID
 }
 
 func (s *relayServer) openTCP(a *agent, t proto.Mapping) error {
@@ -304,6 +314,9 @@ func (s *relayServer) deleteTunnelForAgent(agentID, id string) (bool, error) {
 		return true, fmt.Errorf("agent is not connected")
 	}
 	if err := a.sendAndWaitAck(proto.Message{Type: proto.MsgTunnelRemove, TunnelID: id}); err != nil {
+		// The agent may have applied the deletion before its ACK became unavailable.
+		// Keep the persisted desired state and force a reconnect, which replays it.
+		s.disconnectAgent(a, "tunnel deletion acknowledgement failed")
 		return true, fmt.Errorf("agent did not acknowledge deletion: %w", err)
 	}
 	s.mu.Lock()
@@ -314,7 +327,7 @@ func (s *relayServer) deleteTunnelForAgent(agentID, id string) (bool, error) {
 		for i := range s.cfg.Agents {
 			if s.cfg.Agents[i].ID == agentID {
 				s.cfg.Agents[i].Tunnels = append(s.cfg.Agents[i].Tunnels, tunnel)
-				s.reservedPorts[tunnel.PublicPort] = struct{}{}
+				s.reservedPorts[tunnel.PublicPort]++
 				break
 			}
 		}
@@ -326,11 +339,13 @@ func (s *relayServer) deleteTunnelForAgent(agentID, id string) (bool, error) {
 		return true, err
 	}
 	s.mu.Lock()
-	if r := s.tcp[tunnel.PublicPort]; r != nil {
+	if (tunnel.Network == proto.NetworkTCP || tunnel.Network == proto.NetworkBoth) && matchingTCPRelay(s.tcp[tunnel.PublicPort], a, tunnel.MappingID) {
+		r := s.tcp[tunnel.PublicPort]
 		r.close()
 		delete(s.tcp, tunnel.PublicPort)
 	}
-	if r := s.udp[tunnel.PublicPort]; r != nil {
+	if (tunnel.Network == proto.NetworkUDP || tunnel.Network == proto.NetworkBoth) && matchingUDPRelay(s.udp[tunnel.PublicPort], a, tunnel.MappingID) {
+		r := s.udp[tunnel.PublicPort]
 		r.close()
 		delete(s.udp, tunnel.PublicPort)
 	}

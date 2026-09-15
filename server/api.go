@@ -53,7 +53,7 @@ func (s *relayServer) createTunnel(agentID string, tunnel proto.Mapping) (proto.
 	for i := range s.cfg.Agents {
 		if s.cfg.Agents[i].ID == agentID {
 			s.cfg.Agents[i].Tunnels = append(s.cfg.Agents[i].Tunnels, tunnel)
-			s.reservedPorts[tunnel.PublicPort] = struct{}{}
+			s.reservedPorts[tunnel.PublicPort]++
 			break
 		}
 	}
@@ -106,7 +106,11 @@ func (s *relayServer) removeTunnelConfigLocked(agentID, id string) {
 		for j, tunnel := range s.cfg.Agents[i].Tunnels {
 			if tunnel.ID == id {
 				s.cfg.Agents[i].Tunnels = append(s.cfg.Agents[i].Tunnels[:j], s.cfg.Agents[i].Tunnels[j+1:]...)
-				delete(s.reservedPorts, tunnel.PublicPort)
+				if s.reservedPorts[tunnel.PublicPort] <= 1 {
+					delete(s.reservedPorts, tunnel.PublicPort)
+				} else {
+					s.reservedPorts[tunnel.PublicPort]--
+				}
 				return
 			}
 		}
@@ -165,8 +169,7 @@ func (s *relayServer) registerTunnel(agent *agent, tunnel *proto.Mapping) error 
 func (s *relayServer) portReservedByConfig(port uint16) bool {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	_, reserved := s.reservedPorts[port]
-	return reserved
+	return s.reservedPorts[port] > 0
 }
 func (s *relayServer) saveData() error {
 	s.mu.Lock()
