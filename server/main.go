@@ -92,6 +92,11 @@ type udpFlow struct {
 	lastSeen time.Time
 }
 
+type portReservation struct {
+	tcp int
+	udp int
+}
+
 type relayServer struct {
 	mu            sync.Mutex
 	cfg           config
@@ -101,10 +106,9 @@ type relayServer struct {
 	tcp           map[uint16]*tcpRelay
 	udp           map[uint16]*udpRelay
 	udpSnapshot   atomic.Value
-	// reservedPorts counts persisted mappings for each numeric port. TCP and UDP
-	// may share a numeric port, so one tunnel removal must not release another
-	// mapping's reservation.
-	reservedPorts map[uint16]int
+	// reservedPorts tracks persisted mappings by transport protocol. TCP and UDP
+	// intentionally share a numeric port when their respective reservations allow it.
+	reservedPorts map[uint16]portReservation
 }
 
 func main() {
@@ -123,10 +127,10 @@ func main() {
 	if err := loadTunnelData(dataPath, &cfg); err != nil {
 		log.Fatal(err)
 	}
-	s := &relayServer{cfg: cfg, agentsPath: filepath.Join(secretDir, "agents.json"), dataPath: dataPath, agents: map[string]*agent{}, tcp: map[uint16]*tcpRelay{}, udp: map[uint16]*udpRelay{}, reservedPorts: map[uint16]int{}}
+	s := &relayServer{cfg: cfg, agentsPath: filepath.Join(secretDir, "agents.json"), dataPath: dataPath, agents: map[string]*agent{}, tcp: map[uint16]*tcpRelay{}, udp: map[uint16]*udpRelay{}, reservedPorts: map[uint16]portReservation{}}
 	for _, agent := range cfg.Agents {
 		for _, tunnel := range agent.Tunnels {
-			s.reservedPorts[tunnel.PublicPort]++
+			s.reserveTunnelLocked(tunnel)
 		}
 	}
 	s.udpSnapshot.Store(map[uint16]*udpRelay{})

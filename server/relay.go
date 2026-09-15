@@ -335,7 +335,7 @@ func (s *relayServer) deleteTunnelForAgent(agentID, id string) (bool, error) {
 		for i := range s.cfg.Agents {
 			if s.cfg.Agents[i].ID == agentID {
 				s.cfg.Agents[i].Tunnels = append(s.cfg.Agents[i].Tunnels, tunnel)
-				s.reservedPorts[tunnel.PublicPort]++
+				s.reserveTunnelLocked(tunnel)
 				break
 			}
 		}

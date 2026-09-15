@@ -53,7 +53,7 @@ func (s *relayServer) createTunnel(agentID string, tunnel proto.Mapping) (proto.
 	for i := range s.cfg.Agents {
 		if s.cfg.Agents[i].ID == agentID {
 			s.cfg.Agents[i].Tunnels = append(s.cfg.Agents[i].Tunnels, tunnel)
-			s.reservedPorts[tunnel.PublicPort]++
+			s.reserveTunnelLocked(tunnel)
 			break
 		}
 	}
@@ -106,11 +106,7 @@ func (s *relayServer) removeTunnelConfigLocked(agentID, id string) {
 		for j, tunnel := range s.cfg.Agents[i].Tunnels {
 			if tunnel.ID == id {
 				s.cfg.Agents[i].Tunnels = append(s.cfg.Agents[i].Tunnels[:j], s.cfg.Agents[i].Tunnels[j+1:]...)
-				if s.reservedPorts[tunnel.PublicPort] <= 1 {
-					delete(s.reservedPorts, tunnel.PublicPort)
-				} else {
-					s.reservedPorts[tunnel.PublicPort]--
-				}
+				s.releaseTunnelLocked(tunnel)
 				return
 			}
 		}
@@ -150,7 +146,7 @@ func (s *relayServer) registerTunnel(agent *agent, tunnel *proto.Mapping) error 
 			continue
 		}
 		tried[port] = struct{}{}
-		if s.portReservedByConfig(port) {
+		if s.portReservedByConfig(port, tunnel.Network) {
 			continue
 		}
 		tunnel.PublicPort = port
@@ -166,10 +162,52 @@ func (s *relayServer) registerTunnel(agent *agent, tunnel *proto.Mapping) error 
 	return fmt.Errorf("no available public port in %d-%d", portRange.Start, portRange.End)
 }
 
-func (s *relayServer) portReservedByConfig(port uint16) bool {
+func (s *relayServer) portReservedByConfig(port uint16, network proto.Network) bool {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	return s.reservedPorts[port] > 0
+	reservation := s.reservedPorts[port]
+	switch network {
+	case proto.NetworkTCP:
+		return reservation.tcp > 0
+	case proto.NetworkUDP:
+		return reservation.udp > 0
+	case proto.NetworkBoth:
+		return reservation.tcp > 0 || reservation.udp > 0
+	default:
+		return true
+	}
+}
+
+func (s *relayServer) reserveTunnelLocked(tunnel proto.Mapping) {
+	reservation := s.reservedPorts[tunnel.PublicPort]
+	switch tunnel.Network {
+	case proto.NetworkTCP:
+		reservation.tcp++
+	case proto.NetworkUDP:
+		reservation.udp++
+	case proto.NetworkBoth:
+		reservation.tcp++
+		reservation.udp++
+	}
+	s.reservedPorts[tunnel.PublicPort] = reservation
+}
+
+func (s *relayServer) releaseTunnelLocked(tunnel proto.Mapping) {
+	reservation := s.reservedPorts[tunnel.PublicPort]
+	switch tunnel.Network {
+	case proto.NetworkTCP:
+		reservation.tcp--
+	case proto.NetworkUDP:
+		reservation.udp--
+	case proto.NetworkBoth:
+		reservation.tcp--
+		reservation.udp--
+	}
+	if reservation.tcp == 0 && reservation.udp == 0 {
+		delete(s.reservedPorts, tunnel.PublicPort)
+		return
+	}
+	s.reservedPorts[tunnel.PublicPort] = reservation
 }
 func (s *relayServer) saveData() error {
 	s.mu.Lock()

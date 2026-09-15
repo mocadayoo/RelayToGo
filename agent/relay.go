@@ -134,6 +134,9 @@ func (a *relayAgent) toLocalUDP(port uint16, mappingID, flowID uint64, payload [
 	}
 	a.mu.Unlock()
 	if s != nil {
+		// Keep the session alive for client-to-target traffic too. Without this,
+		// one-way UDP traffic expires even while the public client is active.
+		_ = s.conn.SetReadDeadline(time.Now().Add(2 * time.Minute))
 		_, _ = s.conn.Write(payload)
 	}
 }
