@@ -10,6 +10,7 @@ import (
 	"os"
 	"strings"
 
+	"RelayToGo/internal/logging"
 	proto "RelayToGo/protocol"
 )
 
@@ -60,6 +61,7 @@ func (s *relayServer) createTunnel(agentID string, tunnel proto.Mapping) (proto.
 	if err := s.saveData(); err != nil {
 		return proto.Mapping{}, err
 	}
+	logging.Event("+", "tunnel %s added to %s: %s %d -> %s", tunnel.ID, agentID, tunnel.Network, tunnel.PublicPort, tunnel.TargetAddr)
 	return tunnel, nil
 }
 

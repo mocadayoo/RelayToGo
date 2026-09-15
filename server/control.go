@@ -3,9 +3,9 @@ package main
 import (
 	"context"
 	"encoding/json"
-	"log"
 	"time"
 
+	"RelayToGo/internal/logging"
 	proto "RelayToGo/protocol"
 
 	"github.com/quic-go/quic-go"
@@ -25,6 +25,7 @@ func (s *relayServer) handleAgent(ctx context.Context, conn *quic.Conn) {
 
 	ac, ok := s.auth(m, conn)
 	if !ok {
+		logging.Event("!", "agent connection rejected")
 		_ = enc.Encode(proto.Message{Type: proto.MsgError, Reason: "authentication failed"})
 		return
 	}
@@ -40,8 +41,12 @@ func (s *relayServer) handleAgent(ctx context.Context, conn *quic.Conn) {
 	s.mu.Lock()
 	s.agents[a.id] = a
 	s.mu.Unlock()
+	logging.Event("+", "agent %s connected with %d tunnel(s)", a.id, len(ac.Tunnels))
 
-	defer s.remove(a)
+	defer func() {
+		s.remove(a)
+		logging.Event("-", "agent %s disconnected", a.id)
+	}()
 	if !a.send(proto.Message{Type: proto.MsgRegistered, Mappings: ac.Tunnels, RelayPublicAddr: s.cfg.PublicAddr}) {
 		return
 	}
@@ -62,7 +67,9 @@ func (s *relayServer) handleAgent(ctx context.Context, conn *quic.Conn) {
 		case proto.MsgClose:
 			return
 		case proto.MsgTunnelAck:
-			log.Printf("agent %s acknowledged tunnel %s: %s", a.id, msg.TunnelID, msg.Reason)
+			if msg.Reason != "" {
+				logging.Event("!", "agent %s rejected tunnel %s: %s", a.id, msg.TunnelID, msg.Reason)
+			}
 		case proto.MsgTunnelCreate:
 			if msg.Tunnel == nil {
 				_ = a.send(proto.Message{Type: proto.MsgTunnelResult, RequestID: msg.RequestID, Reason: "missing tunnel"})

@@ -8,6 +8,7 @@ import (
 	"sync"
 	"time"
 
+	"RelayToGo/internal/logging"
 	proto "RelayToGo/protocol"
 )
 
@@ -38,9 +39,14 @@ func (a *relayAgent) controlLoop(ctx context.Context, dec *json.Decoder, writer 
 				continue
 			}
 			a.addTunnel(*message.Tunnel)
+			logging.Event("+", "tunnel %s added: %s %d -> %s", message.Tunnel.ID, message.Tunnel.Network, message.Tunnel.PublicPort, message.Tunnel.TargetAddr)
 			_ = writer.send(proto.Message{Type: proto.MsgTunnelAck, TunnelID: message.Tunnel.ID})
 		case proto.MsgTunnelRemove:
+			a.mu.Lock()
+			tunnel := a.tunnels[message.TunnelID]
+			a.mu.Unlock()
 			a.removeTunnel(message.TunnelID)
+			logging.Event("-", "tunnel %s deleted: %s %d -> %s", message.TunnelID, tunnel.Network, tunnel.PublicPort, tunnel.TargetAddr)
 			_ = writer.send(proto.Message{Type: proto.MsgTunnelAck, TunnelID: message.TunnelID})
 		case proto.MsgTunnelResult:
 			a.deliverResult(message)

@@ -8,6 +8,7 @@ import (
 	"net"
 	"time"
 
+	"RelayToGo/internal/logging"
 	proto "RelayToGo/protocol"
 )
 
@@ -77,7 +78,7 @@ func (s *relayServer) openTCP(a *agent, t proto.Mapping) error {
 		return err
 	}
 
-	r := &tcpRelay{port: t.PublicPort, agent: a, ln: ln, conns: map[net.Conn]struct{}{}}
+	r := &tcpRelay{tunnel: t, agent: a, ln: ln, conns: map[net.Conn]struct{}{}}
 	s.tcp[t.PublicPort] = r
 	go s.acceptTCP(r)
 	return nil
@@ -105,6 +106,7 @@ func (s *relayServer) acceptTCP(r *tcpRelay) {
 			_ = c.Close()
 			continue
 		}
+		logging.Event("+", "client %s connected to tunnel %s", c.RemoteAddr(), r.tunnel.ID)
 		go relayTCP(r, c)
 	}
 }
@@ -140,6 +142,8 @@ func (r *tcpRelay) close() {
 }
 
 func relayTCP(r *tcpRelay, c net.Conn) {
+	client := c.RemoteAddr().String()
+	defer logging.Event("-", "client %s disconnected from tunnel %s", client, r.tunnel.ID)
 	defer r.removeConn(c)
 	defer c.Close()
 	st, e := r.agent.conn.OpenStreamSync(context.Background())
@@ -148,7 +152,7 @@ func relayTCP(r *tcpRelay, c net.Conn) {
 	}
 
 	defer st.Close()
-	if err := binary.Write(st, binary.BigEndian, r.port); err != nil {
+	if err := binary.Write(st, binary.BigEndian, r.tunnel.PublicPort); err != nil {
 		st.CancelWrite(1)
 		return
 	}
@@ -277,6 +281,7 @@ func (s *relayServer) deleteTunnelForAgent(agentID, id string) (bool, error) {
 	if err := s.saveData(); err != nil {
 		return true, err
 	}
+	logging.Event("-", "tunnel %s deleted from %s: %s %d -> %s", id, agentID, tunnel.Network, tunnel.PublicPort, tunnel.TargetAddr)
 	return true, nil
 }
 

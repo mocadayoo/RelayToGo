@@ -15,6 +15,7 @@ import (
 	"syscall"
 	"time"
 
+	"RelayToGo/internal/logging"
 	proto "RelayToGo/protocol"
 
 	"github.com/quic-go/quic-go"
@@ -58,7 +59,7 @@ type agent struct {
 }
 
 type tcpRelay struct {
-	port   uint16
+	tunnel proto.Mapping
 	agent  *agent
 	ln     net.Listener
 	mu     sync.Mutex
@@ -93,6 +94,7 @@ type relayServer struct {
 }
 
 func main() {
+	logging.Configure()
 	path := flag.String("config", "server/config.json", "server configuration")
 	flag.Parse()
 	cfg, err := loadConfig(*path)

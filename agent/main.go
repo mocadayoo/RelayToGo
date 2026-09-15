@@ -13,6 +13,7 @@ import (
 	"syscall"
 	"time"
 
+	"RelayToGo/internal/logging"
 	proto "RelayToGo/protocol"
 
 	"github.com/quic-go/quic-go"
@@ -42,6 +43,7 @@ type relayAgent struct {
 }
 
 func main() {
+	logging.Configure()
 	server := flag.String("server", "127.0.0.1:40000", "server QUIC address")
 	flag.Parse()
 	_, tlsConfig, publicKey, err := loadAgentTLS()
@@ -86,7 +88,6 @@ func main() {
 	a.lastPong.Store(time.Now().UnixNano())
 	writer := &controlWriter{enc: enc}
 	a.control = writer
-	go a.runPanel(ctx)
 	go a.serveUI(agentUIAddr)
 	go a.receiveUDP(ctx)
 	go a.controlLoop(ctx, dec, writer)
