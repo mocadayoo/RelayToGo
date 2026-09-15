@@ -63,7 +63,7 @@ func (a *relayAgent) handleTCP(st *quic.Stream) {
 	<-done
 }
 
-func (a *relayAgent) heartbeat(ctx context.Context, control *quic.Stream, writer *controlWriter) {
+func (a *relayAgent) heartbeat(ctx context.Context, writer *controlWriter) {
 	ticker := time.NewTicker(15 * time.Second)
 	defer ticker.Stop()
 	for {
@@ -71,11 +71,12 @@ func (a *relayAgent) heartbeat(ctx context.Context, control *quic.Stream, writer
 		case <-ctx.Done():
 			return
 		case <-ticker.C:
-			if err := writer.send(proto.Message{Type: proto.MsgPing}); err != nil {
+			if err := writer.send(ctx, proto.Message{Type: proto.MsgPing}); err != nil {
+				_ = a.conn.CloseWithError(0, "control heartbeat failed")
 				return
 			}
 			if time.Since(time.Unix(0, a.lastPong.Load())) > 25*time.Second {
-				_ = control.Close()
+				_ = a.conn.CloseWithError(0, "control heartbeat timed out")
 				return
 			}
 		}

@@ -13,7 +13,10 @@ import (
 	"github.com/quic-go/quic-go"
 )
 
+const controlSendTimeout = 10 * time.Second
+
 func (s *relayServer) handleAgent(ctx context.Context, conn *quic.Conn) {
+	defer conn.CloseWithError(0, "control session ended")
 	control, err := conn.AcceptStream(ctx)
 	if err != nil {
 		return
@@ -145,11 +148,15 @@ func (s *relayServer) handleTunnelDelete(a *agent, msg proto.Message) {
 }
 
 func (a *agent) send(message proto.Message) bool {
+	timer := time.NewTimer(controlSendTimeout)
+	defer timer.Stop()
 	select {
 	case <-a.done:
 		return false
 	case a.outbound <- message:
 		return true
+	case <-timer.C:
+		return false
 	}
 }
 
@@ -193,11 +200,15 @@ func (a *agent) sendAndWaitAck(message proto.Message) error {
 	a.acks[message.TunnelID] = ack
 	a.mu.Unlock()
 	defer func() { a.mu.Lock(); delete(a.acks, message.TunnelID); a.mu.Unlock() }()
-	if !a.send(message) {
-		return fmt.Errorf("control channel unavailable")
-	}
-	timer := time.NewTimer(10 * time.Second)
+	timer := time.NewTimer(controlSendTimeout)
 	defer timer.Stop()
+	select {
+	case <-a.done:
+		return fmt.Errorf("control channel closed")
+	case a.outbound <- message:
+	case <-timer.C:
+		return fmt.Errorf("control send timeout")
+	}
 	select {
 	case result := <-ack:
 		if result.Reason != "" {

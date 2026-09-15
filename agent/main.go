@@ -93,12 +93,12 @@ func main() {
 		a.addTunnel(t)
 	}
 	a.lastPong.Store(time.Now().UnixNano())
-	writer := &controlWriter{enc: enc}
+	writer := &controlWriter{enc: enc, setWriteDeadline: control.SetWriteDeadline}
 	a.control = writer
 	go a.serveUI(agentUIAddr)
 	go a.receiveUDP(ctx)
 	go a.controlLoop(ctx, dec, writer)
-	go a.heartbeat(ctx, control, writer)
+	go a.heartbeat(ctx, writer)
 	log.Printf("attached: %d tunnel(s)", len(reply.Mappings))
 	for {
 		st, err := q.AcceptStream(ctx)

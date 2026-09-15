@@ -12,18 +12,31 @@ import (
 	proto "RelayToGo/protocol"
 )
 
+const controlSendTimeout = 10 * time.Second
+
 type controlWriter struct {
-	mu  sync.Mutex
-	enc *json.Encoder
+	mu               sync.Mutex
+	enc              *json.Encoder
+	setWriteDeadline func(time.Time) error
 }
 
-func (w *controlWriter) send(message proto.Message) error {
+func (w *controlWriter) send(ctx context.Context, message proto.Message) error {
+	deadline := time.Now().Add(controlSendTimeout)
+	if requested, ok := ctx.Deadline(); ok && requested.Before(deadline) {
+		deadline = requested
+	}
 	w.mu.Lock()
 	defer w.mu.Unlock()
-	return w.enc.Encode(message)
+	if err := w.setWriteDeadline(deadline); err != nil {
+		return err
+	}
+	err := w.enc.Encode(message)
+	_ = w.setWriteDeadline(time.Time{})
+	return err
 }
 
 func (a *relayAgent) controlLoop(ctx context.Context, dec *json.Decoder, writer *controlWriter) {
+	defer a.conn.CloseWithError(0, "control stream ended")
 	for {
 		var message proto.Message
 		if err := dec.Decode(&message); err != nil {
@@ -35,19 +48,25 @@ func (a *relayAgent) controlLoop(ctx context.Context, dec *json.Decoder, writer 
 			a.lastPong.Store(time.Now().UnixNano())
 		case proto.MsgTunnelAdd:
 			if message.Tunnel == nil {
-				_ = writer.send(proto.Message{Type: proto.MsgTunnelAck, TunnelID: message.TunnelID, Reason: "missing tunnel"})
+				if writer.send(ctx, proto.Message{Type: proto.MsgTunnelAck, TunnelID: message.TunnelID, Reason: "missing tunnel"}) != nil {
+					return
+				}
 				continue
 			}
 			a.addTunnel(*message.Tunnel)
 			logging.Event("+", "tunnel %s added: %s %d -> %s", message.Tunnel.ID, message.Tunnel.Network, message.Tunnel.PublicPort, message.Tunnel.TargetAddr)
-			_ = writer.send(proto.Message{Type: proto.MsgTunnelAck, TunnelID: message.Tunnel.ID})
+			if writer.send(ctx, proto.Message{Type: proto.MsgTunnelAck, TunnelID: message.Tunnel.ID}) != nil {
+				return
+			}
 		case proto.MsgTunnelRemove:
 			a.mu.Lock()
 			tunnel := a.tunnels[message.TunnelID]
 			a.mu.Unlock()
 			a.removeTunnel(message.TunnelID)
 			logging.Event("-", "tunnel %s deleted: %s %d -> %s", message.TunnelID, tunnel.Network, tunnel.PublicPort, tunnel.TargetAddr)
-			_ = writer.send(proto.Message{Type: proto.MsgTunnelAck, TunnelID: message.TunnelID})
+			if writer.send(ctx, proto.Message{Type: proto.MsgTunnelAck, TunnelID: message.TunnelID}) != nil {
+				return
+			}
 		case proto.MsgTunnelResult:
 			a.deliverResult(message)
 		}
@@ -74,7 +93,8 @@ func (a *relayAgent) requestTunnel(ctx context.Context, message proto.Message) (
 	a.pending[requestID] = result
 	a.mu.Unlock()
 	message.RequestID = requestID
-	if err := a.control.send(message); err != nil {
+	if err := a.control.send(ctx, message); err != nil {
+		_ = a.conn.CloseWithError(0, "control write failed")
 		a.mu.Lock()
 		delete(a.pending, requestID)
 		a.mu.Unlock()
