@@ -38,8 +38,26 @@ func (s *tunnelStats) snapshot() (uint64, uint64, int) {
 }
 
 func (a *relayAgent) statsFor(network proto.Network, port uint16) *tunnelStats {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	return a.statsForLocked(network, port)
+}
+
+func (a *relayAgent) statsForLocked(network proto.Network, port uint16) *tunnelStats {
 	if stats := a.stats[string(network)+fmt.Sprintf(":%d", port)]; stats != nil {
 		return stats
 	}
 	return a.stats[string(proto.NetworkBoth)+fmt.Sprintf(":%d", port)]
+}
+
+func (a *relayAgent) tcpTargetAndStats(port uint16) (string, *tunnelStats) {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	return a.tcp[port], a.statsForLocked(proto.NetworkTCP, port)
+}
+
+func (a *relayAgent) hasUDP(port uint16) bool {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	return a.udp[port] != ""
 }

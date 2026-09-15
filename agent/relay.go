@@ -20,8 +20,8 @@ func (a *relayAgent) handleTCP(st *quic.Stream) {
 		return
 	}
 
-	target := a.tcp[p]
-	if target == "" {
+	target, stats := a.tcpTargetAndStats(p)
+	if target == "" || stats == nil {
 		return
 	}
 
@@ -33,7 +33,6 @@ func (a *relayAgent) handleTCP(st *quic.Stream) {
 	}
 
 	defer local.Close()
-	stats := a.statsFor(proto.NetworkTCP, p)
 	stats.addClient(1)
 	defer stats.addClient(-1)
 
@@ -85,7 +84,7 @@ func (a *relayAgent) receiveUDP(ctx context.Context) {
 		}
 
 		p, flowID, payload, err := proto.UnmarshalUDPDatagram(d)
-		if err != nil || a.udp[p] == "" {
+		if err != nil || !a.hasUDP(p) {
 			continue
 		}
 
@@ -94,10 +93,14 @@ func (a *relayAgent) receiveUDP(ctx context.Context) {
 }
 
 func (a *relayAgent) toLocalUDP(port uint16, flowID uint64, payload []byte) {
-	a.statsFor(proto.NetworkUDP, port).addIn(len(payload))
-
 	key := fmt.Sprintf("%d:%d", port, flowID)
 	a.mu.Lock()
+	stats := a.statsForLocked(proto.NetworkUDP, port)
+	if stats == nil {
+		a.mu.Unlock()
+		return
+	}
+	stats.addIn(len(payload))
 	s := a.sessions[key]
 	if s == nil {
 		target, e := net.ResolveUDPAddr("udp", a.udp[port])
@@ -106,7 +109,7 @@ func (a *relayAgent) toLocalUDP(port uint16, flowID uint64, payload []byte) {
 			if e == nil {
 				s = &udpSession{conn: c, port: port, flowID: flowID}
 				a.sessions[key] = s
-				a.statsFor(proto.NetworkUDP, port).addClient(1)
+				stats.addClient(1)
 				go a.fromLocalUDP(key, s)
 			}
 		}
@@ -126,7 +129,9 @@ func (a *relayAgent) fromLocalUDP(key string, s *udpSession) {
 			a.mu.Lock()
 			if a.sessions[key] == s {
 				delete(a.sessions, key)
-				a.statsFor(proto.NetworkUDP, s.port).addClient(-1)
+				if stats := a.statsForLocked(proto.NetworkUDP, s.port); stats != nil {
+					stats.addClient(-1)
+				}
 			}
 			a.mu.Unlock()
 			_ = s.conn.Close()
@@ -135,7 +140,9 @@ func (a *relayAgent) fromLocalUDP(key string, s *udpSession) {
 
 		d, e := proto.MarshalUDPDatagram(s.port, s.flowID, b[:n])
 		if e == nil {
-			a.statsFor(proto.NetworkUDP, s.port).addOut(n)
+			if stats := a.statsFor(proto.NetworkUDP, s.port); stats != nil {
+				stats.addOut(n)
+			}
 			_ = a.conn.SendDatagram(d)
 		}
 	}
