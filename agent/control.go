@@ -112,6 +112,17 @@ func (a *relayAgent) removeTunnel(id string) {
 		return
 	}
 
+	stats := a.stats[tunnelKey(tunnel.Network, tunnel.PublicPort)]
+	for key, session := range a.sessions {
+		if session.port != tunnel.PublicPort {
+			continue
+		}
+		delete(a.sessions, key)
+		_ = session.conn.Close()
+		if stats != nil {
+			stats.addClient(-1)
+		}
+	}
 	delete(a.tunnels, id)
 	delete(a.stats, tunnelKey(tunnel.Network, tunnel.PublicPort))
 	delete(a.tcp, tunnel.PublicPort)

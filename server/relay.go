@@ -9,8 +9,6 @@ import (
 	"time"
 
 	proto "RelayToGo/protocol"
-
-	"github.com/quic-go/quic-go"
 )
 
 func (s *relayServer) register(a *agent, ts []proto.Mapping) error {
@@ -63,7 +61,7 @@ func (s *relayServer) register(a *agent, ts []proto.Mapping) error {
 func (s *relayServer) rollbackMappingsLocked(a *agent, tunnels []proto.Mapping) {
 	for _, t := range tunnels {
 		if r := s.tcp[t.PublicPort]; r != nil && r.agent == a {
-			_ = r.ln.Close()
+			r.close()
 			delete(s.tcp, t.PublicPort)
 		}
 		if r := s.udp[t.PublicPort]; r != nil && r.agent == a {
@@ -79,7 +77,7 @@ func (s *relayServer) openTCP(a *agent, t proto.Mapping) error {
 		return err
 	}
 
-	r := &tcpRelay{t.PublicPort, a, ln}
+	r := &tcpRelay{port: t.PublicPort, agent: a, ln: ln, conns: map[net.Conn]struct{}{}}
 	s.tcp[t.PublicPort] = r
 	go s.acceptTCP(r)
 	return nil
@@ -103,19 +101,54 @@ func (s *relayServer) acceptTCP(r *tcpRelay) {
 		if e != nil {
 			return
 		}
-		go relayTCP(c, r.agent.conn, r.port)
+		if !r.addConn(c) {
+			_ = c.Close()
+			continue
+		}
+		go relayTCP(r, c)
 	}
 }
 
-func relayTCP(c net.Conn, q *quic.Conn, p uint16) {
+func (r *tcpRelay) addConn(c net.Conn) bool {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if r.closed {
+		return false
+	}
+	r.conns[c] = struct{}{}
+	return true
+}
+
+func (r *tcpRelay) removeConn(c net.Conn) {
+	r.mu.Lock()
+	delete(r.conns, c)
+	r.mu.Unlock()
+}
+
+func (r *tcpRelay) close() {
+	r.mu.Lock()
+	if r.closed {
+		r.mu.Unlock()
+		return
+	}
+	r.closed = true
+	_ = r.ln.Close()
+	for c := range r.conns {
+		_ = c.Close()
+	}
+	r.mu.Unlock()
+}
+
+func relayTCP(r *tcpRelay, c net.Conn) {
+	defer r.removeConn(c)
 	defer c.Close()
-	st, e := q.OpenStreamSync(context.Background())
+	st, e := r.agent.conn.OpenStreamSync(context.Background())
 	if e != nil {
 		return
 	}
 
 	defer st.Close()
-	if err := binary.Write(st, binary.BigEndian, p); err != nil {
+	if err := binary.Write(st, binary.BigEndian, r.port); err != nil {
 		st.CancelWrite(1)
 		return
 	}
@@ -230,7 +263,7 @@ func (s *relayServer) deleteTunnelForAgent(agentID, id string) (bool, error) {
 		return false, nil
 	}
 	if r := s.tcp[tunnel.PublicPort]; r != nil {
-		_ = r.ln.Close()
+		r.close()
 		delete(s.tcp, tunnel.PublicPort)
 	}
 	if r := s.udp[tunnel.PublicPort]; r != nil {
@@ -252,7 +285,7 @@ func (s *relayServer) removeLocked(a *agent) {
 
 	for p, r := range s.tcp {
 		if r.agent == a {
-			_ = r.ln.Close()
+			r.close()
 			delete(s.tcp, p)
 		}
 	}

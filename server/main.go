@@ -58,9 +58,12 @@ type agent struct {
 }
 
 type tcpRelay struct {
-	port  uint16
-	agent *agent
-	ln    net.Listener
+	port   uint16
+	agent  *agent
+	ln     net.Listener
+	mu     sync.Mutex
+	conns  map[net.Conn]struct{}
+	closed bool
 }
 
 type udpRelay struct {
