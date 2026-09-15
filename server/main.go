@@ -55,13 +55,14 @@ type agentTunnelData struct {
 }
 
 type agent struct {
-	id        string
-	conn      *quic.Conn
-	outbound  chan proto.Message
-	done      chan struct{}
-	acks      map[string]chan proto.Message
-	mu        sync.Mutex
-	closeOnce sync.Once
+	id         string
+	conn       *quic.Conn
+	outbound   chan proto.Message
+	done       chan struct{}
+	acks       map[string]chan proto.Message
+	mu         sync.Mutex
+	operations chan proto.Message
+	closeOnce  sync.Once
 }
 
 type tcpRelay struct {

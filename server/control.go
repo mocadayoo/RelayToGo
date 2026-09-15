@@ -32,8 +32,9 @@ func (s *relayServer) handleAgent(ctx context.Context, conn *quic.Conn) {
 		return
 	}
 
-	a := &agent{id: ac.ID, conn: conn, outbound: make(chan proto.Message, 32), done: make(chan struct{}), acks: map[string]chan proto.Message{}}
+	a := &agent{id: ac.ID, conn: conn, outbound: make(chan proto.Message, 32), done: make(chan struct{}), acks: map[string]chan proto.Message{}, operations: make(chan proto.Message, 64)}
 	go a.sendLoop(enc)
+	go s.operationLoop(a)
 	s.mu.Lock()
 	previous := s.agents[a.id]
 	if previous != nil {
@@ -86,27 +87,61 @@ func (s *relayServer) handleAgent(ctx context.Context, conn *quic.Conn) {
 				logging.Event("!", "agent %s rejected tunnel %s: %s", a.id, msg.TunnelID, msg.Reason)
 			}
 		case proto.MsgTunnelCreate:
-			if msg.Tunnel == nil {
-				_ = a.send(proto.Message{Type: proto.MsgTunnelResult, RequestID: msg.RequestID, Reason: "missing tunnel"})
-				continue
-			}
-			tunnel, err := s.createTunnel(a.id, *msg.Tunnel)
-			if err != nil {
-				_ = a.send(proto.Message{Type: proto.MsgTunnelResult, RequestID: msg.RequestID, Reason: err.Error()})
-				continue
-			}
-			_ = a.send(proto.Message{Type: proto.MsgTunnelResult, RequestID: msg.RequestID, Tunnel: &tunnel, TunnelID: tunnel.ID})
+			a.enqueueOperation(msg)
 		case proto.MsgTunnelDelete:
-			deleted, err := s.deleteTunnelForAgent(a.id, msg.TunnelID)
-			result := proto.Message{Type: proto.MsgTunnelResult, RequestID: msg.RequestID, TunnelID: msg.TunnelID}
-			if err != nil {
-				result.Reason = err.Error()
-			} else if !deleted {
-				result.Reason = "tunnel not found"
-			}
-			_ = a.send(result)
+			a.enqueueOperation(msg)
 		}
 	}
+}
+
+func (a *agent) enqueueOperation(msg proto.Message) {
+	select {
+	case <-a.done:
+		return
+	case a.operations <- msg:
+	default:
+		_ = a.send(proto.Message{Type: proto.MsgTunnelResult, RequestID: msg.RequestID, TunnelID: msg.TunnelID, Reason: "too many pending tunnel operations"})
+	}
+}
+
+func (s *relayServer) operationLoop(a *agent) {
+	for {
+		select {
+		case <-a.done:
+			return
+		case msg := <-a.operations:
+			switch msg.Type {
+			case proto.MsgTunnelCreate:
+				s.handleTunnelCreate(a, msg)
+			case proto.MsgTunnelDelete:
+				s.handleTunnelDelete(a, msg)
+			}
+		}
+	}
+}
+
+func (s *relayServer) handleTunnelCreate(a *agent, msg proto.Message) {
+	if msg.Tunnel == nil {
+		_ = a.send(proto.Message{Type: proto.MsgTunnelResult, RequestID: msg.RequestID, Reason: "missing tunnel"})
+		return
+	}
+	tunnel, err := s.createTunnel(a.id, *msg.Tunnel)
+	if err != nil {
+		_ = a.send(proto.Message{Type: proto.MsgTunnelResult, RequestID: msg.RequestID, Reason: err.Error()})
+		return
+	}
+	_ = a.send(proto.Message{Type: proto.MsgTunnelResult, RequestID: msg.RequestID, Tunnel: &tunnel, TunnelID: tunnel.ID})
+}
+
+func (s *relayServer) handleTunnelDelete(a *agent, msg proto.Message) {
+	deleted, err := s.deleteTunnelForAgent(a.id, msg.TunnelID)
+	result := proto.Message{Type: proto.MsgTunnelResult, RequestID: msg.RequestID, TunnelID: msg.TunnelID}
+	if err != nil {
+		result.Reason = err.Error()
+	} else if !deleted {
+		result.Reason = "tunnel not found"
+	}
+	_ = a.send(result)
 }
 
 func (a *agent) send(message proto.Message) bool {
