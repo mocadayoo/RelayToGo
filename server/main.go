@@ -8,10 +8,12 @@ import (
 	"fmt"
 	"log"
 	"net"
+	"net/netip"
 	"os"
 	"os/signal"
 	"path/filepath"
 	"sync"
+	"sync/atomic"
 	"syscall"
 	"time"
 
@@ -53,9 +55,13 @@ type agentTunnelData struct {
 }
 
 type agent struct {
-	id       string
-	conn     *quic.Conn
-	outbound chan proto.Message
+	id        string
+	conn      *quic.Conn
+	outbound  chan proto.Message
+	done      chan struct{}
+	acks      map[string]chan proto.Message
+	mu        sync.Mutex
+	closeOnce sync.Once
 }
 
 type tcpRelay struct {
@@ -68,29 +74,33 @@ type tcpRelay struct {
 }
 
 type udpRelay struct {
-	port       uint16
+	tunnel     proto.Mapping
 	agent      *agent
 	conn       *net.UDPConn
 	mu         sync.Mutex
 	nextFlowID uint64
-	flows      map[string]*udpFlow
+	flows      map[netip.AddrPort]*udpFlow
 	byID       map[uint64]*udpFlow
+	done       chan struct{}
+	closeOnce  sync.Once
 }
 
 type udpFlow struct {
 	id       uint64
-	address  *net.UDPAddr
+	address  netip.AddrPort
 	lastSeen time.Time
 }
 
 type relayServer struct {
-	mu         sync.Mutex
-	cfg        config
-	agentsPath string
-	dataPath   string
-	agents     map[string]*agent
-	tcp        map[uint16]*tcpRelay
-	udp        map[uint16]*udpRelay
+	mu            sync.Mutex
+	cfg           config
+	agentsPath    string
+	dataPath      string
+	agents        map[string]*agent
+	tcp           map[uint16]*tcpRelay
+	udp           map[uint16]*udpRelay
+	udpSnapshot   atomic.Value
+	reservedPorts map[uint16]struct{}
 }
 
 func main() {
@@ -109,7 +119,13 @@ func main() {
 	if err := loadTunnelData(dataPath, &cfg); err != nil {
 		log.Fatal(err)
 	}
-	s := &relayServer{cfg: cfg, agentsPath: filepath.Join(secretDir, "agents.json"), dataPath: dataPath, agents: map[string]*agent{}, tcp: map[uint16]*tcpRelay{}, udp: map[uint16]*udpRelay{}}
+	s := &relayServer{cfg: cfg, agentsPath: filepath.Join(secretDir, "agents.json"), dataPath: dataPath, agents: map[string]*agent{}, tcp: map[uint16]*tcpRelay{}, udp: map[uint16]*udpRelay{}, reservedPorts: map[uint16]struct{}{}}
+	for _, agent := range cfg.Agents {
+		for _, tunnel := range agent.Tunnels {
+			s.reservedPorts[tunnel.PublicPort] = struct{}{}
+		}
+	}
+	s.udpSnapshot.Store(map[uint16]*udpRelay{})
 	tlsConf, serverFingerprint, err := loadOrCreateServerTLS(secretDir, s.hasAgentKey)
 	if err != nil {
 		log.Fatal(err)
