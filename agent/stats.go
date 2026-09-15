@@ -50,14 +50,19 @@ func (a *relayAgent) statsForLocked(network proto.Network, port uint16) *tunnelS
 	return a.stats[string(proto.NetworkBoth)+fmt.Sprintf(":%d", port)]
 }
 
-func (a *relayAgent) tcpTargetAndStats(port uint16) (string, *tunnelStats) {
+func (a *relayAgent) tcpTargetAndStats(port uint16, mappingID uint64) (string, *tunnelStats) {
 	a.mu.Lock()
 	defer a.mu.Unlock()
-	return a.tcp[port], a.statsForLocked(proto.NetworkTCP, port)
+	tunnel, ok := a.tcp[port]
+	if !ok || tunnel.MappingID != mappingID {
+		return "", nil
+	}
+	return tunnel.TargetAddr, a.statsForLocked(proto.NetworkTCP, port)
 }
 
-func (a *relayAgent) hasUDP(port uint16) bool {
+func (a *relayAgent) hasUDP(port uint16, mappingID uint64) bool {
 	a.mu.Lock()
 	defer a.mu.Unlock()
-	return a.udp[port] != ""
+	tunnel, ok := a.udp[port]
+	return ok && tunnel.MappingID == mappingID
 }

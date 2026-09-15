@@ -37,6 +37,7 @@ type Mapping struct {
 	Name       string  `json:"name"`
 	Network    Network `json:"network"`
 	PublicPort uint16  `json:"public_port"`
+	MappingID  uint64  `json:"mapping_id"`
 	TargetAddr string  `json:"target_addr"`
 }
 
@@ -47,26 +48,27 @@ type Message struct {
 	TunnelID        string      `json:"tunnel_id,omitempty"`
 	RequestID       string      `json:"request_id,omitempty"`
 	RelayPublicAddr string      `json:"relay_public_addr,omitempty"`
-	MappingID       uint32      `json:"mapping_id,omitempty"`
 	Reason          string      `json:"reason,omitempty"`
 }
 
-func MarshalUDPDatagram(port uint16, flowID uint64, payload []byte) ([]byte, error) {
-	packet := make([]byte, 10+len(payload))
+func MarshalUDPDatagram(port uint16, mappingID, flowID uint64, payload []byte) ([]byte, error) {
+	packet := make([]byte, 18+len(payload))
 	binary.BigEndian.PutUint16(packet[:2], port)
-	binary.BigEndian.PutUint64(packet[2:10], flowID)
-	copy(packet[10:], payload)
+	binary.BigEndian.PutUint64(packet[2:10], mappingID)
+	binary.BigEndian.PutUint64(packet[10:18], flowID)
+	copy(packet[18:], payload)
 	return packet, nil
 }
 
-func UnmarshalUDPDatagram(packet []byte) (port uint16, flowID uint64, payload []byte, err error) {
-	if len(packet) < 10 {
+func UnmarshalUDPDatagram(packet []byte) (port uint16, mappingID, flowID uint64, payload []byte, err error) {
+	if len(packet) < 18 {
 		err = fmt.Errorf("UDP datagram header is truncated")
 		return
 	}
 
 	port = binary.BigEndian.Uint16(packet[:2])
-	flowID = binary.BigEndian.Uint64(packet[2:10])
-	payload = packet[10:]
+	mappingID = binary.BigEndian.Uint64(packet[2:10])
+	flowID = binary.BigEndian.Uint64(packet[10:18])
+	payload = packet[18:]
 	return
 }

@@ -3,9 +3,9 @@ package main
 import (
 	"context"
 	"encoding/binary"
-	"fmt"
 	"io"
 	"net"
+	"sync"
 	"time"
 
 	proto "RelayToGo/protocol"
@@ -13,14 +13,20 @@ import (
 	"github.com/quic-go/quic-go"
 )
 
+var udpBuffers = sync.Pool{New: func() any { return make([]byte, 65535) }}
+
 func (a *relayAgent) handleTCP(st *quic.Stream) {
 	defer st.Close()
 	var p uint16
 	if err := binary.Read(st, binary.BigEndian, &p); err != nil {
 		return
 	}
+	var mappingID uint64
+	if err := binary.Read(st, binary.BigEndian, &mappingID); err != nil {
+		return
+	}
 
-	target, stats := a.tcpTargetAndStats(p)
+	target, stats := a.tcpTargetAndStats(p, mappingID)
 	if target == "" || stats == nil {
 		return
 	}
@@ -83,17 +89,17 @@ func (a *relayAgent) receiveUDP(ctx context.Context) {
 			return
 		}
 
-		p, flowID, payload, err := proto.UnmarshalUDPDatagram(d)
-		if err != nil || !a.hasUDP(p) {
+		p, mappingID, flowID, payload, err := proto.UnmarshalUDPDatagram(d)
+		if err != nil || !a.hasUDP(p, mappingID) {
 			continue
 		}
 
-		a.toLocalUDP(p, flowID, payload)
+		a.toLocalUDP(p, mappingID, flowID, payload)
 	}
 }
 
-func (a *relayAgent) toLocalUDP(port uint16, flowID uint64, payload []byte) {
-	key := fmt.Sprintf("%d:%d", port, flowID)
+func (a *relayAgent) toLocalUDP(port uint16, mappingID, flowID uint64, payload []byte) {
+	key := udpSessionKey{port: port, mappingID: mappingID, flowID: flowID}
 	a.mu.Lock()
 	stats := a.statsForLocked(proto.NetworkUDP, port)
 	if stats == nil {
@@ -103,11 +109,16 @@ func (a *relayAgent) toLocalUDP(port uint16, flowID uint64, payload []byte) {
 	stats.addIn(len(payload))
 	s := a.sessions[key]
 	if s == nil {
-		target, e := net.ResolveUDPAddr("udp", a.udp[port])
+		tunnel, exists := a.udp[port]
+		if !exists || tunnel.MappingID != mappingID {
+			a.mu.Unlock()
+			return
+		}
+		target, e := net.ResolveUDPAddr("udp", tunnel.TargetAddr)
 		if e == nil {
 			c, e := net.DialUDP("udp", nil, target)
 			if e == nil {
-				s = &udpSession{conn: c, port: port, flowID: flowID}
+				s = &udpSession{conn: c, port: port, mappingID: mappingID, flowID: flowID, stats: stats}
 				a.sessions[key] = s
 				stats.addClient(1)
 				go a.fromLocalUDP(key, s)
@@ -120,8 +131,9 @@ func (a *relayAgent) toLocalUDP(port uint16, flowID uint64, payload []byte) {
 	}
 }
 
-func (a *relayAgent) fromLocalUDP(key string, s *udpSession) {
-	b := make([]byte, 65535)
+func (a *relayAgent) fromLocalUDP(key udpSessionKey, s *udpSession) {
+	b := udpBuffers.Get().([]byte)
+	defer udpBuffers.Put(b)
 	for {
 		s.conn.SetReadDeadline(time.Now().Add(2 * time.Minute))
 		n, e := s.conn.Read(b)
@@ -129,20 +141,16 @@ func (a *relayAgent) fromLocalUDP(key string, s *udpSession) {
 			a.mu.Lock()
 			if a.sessions[key] == s {
 				delete(a.sessions, key)
-				if stats := a.statsForLocked(proto.NetworkUDP, s.port); stats != nil {
-					stats.addClient(-1)
-				}
+				s.stats.addClient(-1)
 			}
 			a.mu.Unlock()
 			_ = s.conn.Close()
 			return
 		}
 
-		d, e := proto.MarshalUDPDatagram(s.port, s.flowID, b[:n])
+		d, e := proto.MarshalUDPDatagram(s.port, s.mappingID, s.flowID, b[:n])
 		if e == nil {
-			if stats := a.statsFor(proto.NetworkUDP, s.port); stats != nil {
-				stats.addOut(n)
-			}
+			s.stats.addOut(n)
 			_ = a.conn.SendDatagram(d)
 		}
 	}

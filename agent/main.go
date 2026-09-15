@@ -19,23 +19,30 @@ import (
 	"github.com/quic-go/quic-go"
 )
 
+const agentUIAddr = "127.0.0.1:41002"
+
 type udpSession struct {
-	conn   *net.UDPConn
-	port   uint16
-	flowID uint64
+	conn      *net.UDPConn
+	port      uint16
+	mappingID uint64
+	flowID    uint64
+	stats     *tunnelStats
 }
 
-const agentUIAddr = "127.0.0.1:41002"
+type udpSessionKey struct {
+	port              uint16
+	mappingID, flowID uint64
+}
 
 type relayAgent struct {
 	conn            *quic.Conn
 	relayPublicAddr string
-	tcp             map[uint16]string
-	udp             map[uint16]string
+	tcp             map[uint16]proto.Mapping
+	udp             map[uint16]proto.Mapping
 	tunnels         map[string]proto.Mapping
 	stats           map[string]*tunnelStats
 	mu              sync.Mutex
-	sessions        map[string]*udpSession
+	sessions        map[udpSessionKey]*udpSession
 	control         *controlWriter
 	pending         map[string]chan proto.Message
 	requestSeq      atomic.Uint64
@@ -81,7 +88,7 @@ func main() {
 		log.Fatalf("registration rejected: %s", reply.Reason)
 	}
 
-	a := &relayAgent{conn: q, relayPublicAddr: reply.RelayPublicAddr, tcp: map[uint16]string{}, udp: map[uint16]string{}, tunnels: map[string]proto.Mapping{}, stats: map[string]*tunnelStats{}, sessions: map[string]*udpSession{}, pending: map[string]chan proto.Message{}}
+	a := &relayAgent{conn: q, relayPublicAddr: reply.RelayPublicAddr, tcp: map[uint16]proto.Mapping{}, udp: map[uint16]proto.Mapping{}, tunnels: map[string]proto.Mapping{}, stats: map[string]*tunnelStats{}, sessions: map[udpSessionKey]*udpSession{}, pending: map[string]chan proto.Message{}}
 	for _, t := range reply.Mappings {
 		a.addTunnel(t)
 	}

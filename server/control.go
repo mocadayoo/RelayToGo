@@ -3,6 +3,8 @@ package main
 import (
 	"context"
 	"encoding/json"
+	"errors"
+	"fmt"
 	"time"
 
 	"RelayToGo/internal/logging"
@@ -30,11 +32,22 @@ func (s *relayServer) handleAgent(ctx context.Context, conn *quic.Conn) {
 		return
 	}
 
-	a := &agent{id: ac.ID, conn: conn, outbound: make(chan proto.Message, 32)}
+	a := &agent{id: ac.ID, conn: conn, outbound: make(chan proto.Message, 32), done: make(chan struct{}), acks: map[string]chan proto.Message{}}
 	go a.sendLoop(enc)
+	s.mu.Lock()
+	previous := s.agents[a.id]
+	if previous != nil {
+		s.removeLocked(previous)
+	}
+	s.mu.Unlock()
+	if previous != nil {
+		previous.stop()
+		_ = previous.conn.CloseWithError(0, "replaced by a new connection")
+	}
 
 	if err = s.register(a, ac.Tunnels); err != nil {
-		_ = enc.Encode(proto.Message{Type: proto.MsgError, Reason: err.Error()})
+		_ = a.send(proto.Message{Type: proto.MsgError, Reason: err.Error()})
+		a.stop()
 		return
 	}
 
@@ -44,6 +57,7 @@ func (s *relayServer) handleAgent(ctx context.Context, conn *quic.Conn) {
 	logging.Event("+", "agent %s connected with %d tunnel(s)", a.id, len(ac.Tunnels))
 
 	defer func() {
+		a.stop()
 		s.remove(a)
 		logging.Event("-", "agent %s disconnected", a.id)
 	}()
@@ -67,6 +81,7 @@ func (s *relayServer) handleAgent(ctx context.Context, conn *quic.Conn) {
 		case proto.MsgClose:
 			return
 		case proto.MsgTunnelAck:
+			a.completeAck(msg)
 			if msg.Reason != "" {
 				logging.Event("!", "agent %s rejected tunnel %s: %s", a.id, msg.TunnelID, msg.Reason)
 			}
@@ -96,30 +111,70 @@ func (s *relayServer) handleAgent(ctx context.Context, conn *quic.Conn) {
 
 func (a *agent) send(message proto.Message) bool {
 	select {
+	case <-a.done:
+		return false
 	case a.outbound <- message:
 		return true
-	default:
-		return false
 	}
 }
 
 func (a *agent) sendLoop(enc *json.Encoder) {
-	for message := range a.outbound {
-		if err := enc.Encode(message); err != nil {
+	defer a.stop()
+	for {
+		select {
+		case <-a.done:
 			return
+		case message := <-a.outbound:
+			if err := enc.Encode(message); err != nil {
+				return
+			}
 		}
 	}
 }
 
-func (s *relayServer) notifyTunnelAdd(agentID string, tunnel proto.Mapping) bool {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	agent := s.agents[agentID]
-	if agent == nil {
-		return false
-	}
+func (a *agent) stop() { a.closeOnce.Do(func() { close(a.done) }) }
 
-	return agent.send(proto.Message{Type: proto.MsgTunnelAdd, Tunnel: &tunnel, TunnelID: tunnel.ID})
+func (a *agent) sendAndWaitAck(message proto.Message) error {
+	if message.TunnelID == "" {
+		return fmt.Errorf("missing tunnel ID")
+	}
+	ack := make(chan proto.Message, 1)
+	a.mu.Lock()
+	if _, exists := a.acks[message.TunnelID]; exists {
+		a.mu.Unlock()
+		return fmt.Errorf("tunnel operation already pending")
+	}
+	a.acks[message.TunnelID] = ack
+	a.mu.Unlock()
+	defer func() { a.mu.Lock(); delete(a.acks, message.TunnelID); a.mu.Unlock() }()
+	if !a.send(message) {
+		return fmt.Errorf("control channel unavailable")
+	}
+	timer := time.NewTimer(10 * time.Second)
+	defer timer.Stop()
+	select {
+	case result := <-ack:
+		if result.Reason != "" {
+			return errors.New(result.Reason)
+		}
+		return nil
+	case <-a.done:
+		return fmt.Errorf("control channel closed")
+	case <-timer.C:
+		return fmt.Errorf("acknowledgement timeout")
+	}
+}
+
+func (a *agent) completeAck(message proto.Message) {
+	a.mu.Lock()
+	ack := a.acks[message.TunnelID]
+	a.mu.Unlock()
+	if ack != nil {
+		select {
+		case ack <- message:
+		default:
+		}
+	}
 }
 
 func (s *relayServer) auth(m proto.Message, conn *quic.Conn) (agentConfig, bool) {

@@ -101,12 +101,12 @@ func (a *relayAgent) addTunnel(tunnel proto.Mapping) {
 	a.stats[tunnelKey(tunnel.Network, tunnel.PublicPort)] = &tunnelStats{}
 	switch tunnel.Network {
 	case proto.NetworkTCP:
-		a.tcp[tunnel.PublicPort] = tunnel.TargetAddr
+		a.tcp[tunnel.PublicPort] = tunnel
 	case proto.NetworkUDP:
-		a.udp[tunnel.PublicPort] = tunnel.TargetAddr
+		a.udp[tunnel.PublicPort] = tunnel
 	case proto.NetworkBoth:
-		a.tcp[tunnel.PublicPort] = tunnel.TargetAddr
-		a.udp[tunnel.PublicPort] = tunnel.TargetAddr
+		a.tcp[tunnel.PublicPort] = tunnel
+		a.udp[tunnel.PublicPort] = tunnel
 	}
 }
 
@@ -118,16 +118,13 @@ func (a *relayAgent) removeTunnel(id string) {
 		return
 	}
 
-	stats := a.stats[tunnelKey(tunnel.Network, tunnel.PublicPort)]
 	for key, session := range a.sessions {
 		if session.port != tunnel.PublicPort {
 			continue
 		}
 		delete(a.sessions, key)
 		_ = session.conn.Close()
-		if stats != nil {
-			stats.addClient(-1)
-		}
+		session.stats.addClient(-1)
 	}
 	delete(a.tunnels, id)
 	delete(a.stats, tunnelKey(tunnel.Network, tunnel.PublicPort))

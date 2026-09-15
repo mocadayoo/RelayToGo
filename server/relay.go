@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"io"
 	"net"
+	"net/netip"
 	"time"
 
 	"RelayToGo/internal/logging"
@@ -56,6 +57,7 @@ func (s *relayServer) register(a *agent, ts []proto.Mapping) error {
 			}
 		}
 	}
+	s.publishUDPSnapshotLocked()
 	return nil
 }
 
@@ -66,10 +68,11 @@ func (s *relayServer) rollbackMappingsLocked(a *agent, tunnels []proto.Mapping) 
 			delete(s.tcp, t.PublicPort)
 		}
 		if r := s.udp[t.PublicPort]; r != nil && r.agent == a {
-			_ = r.conn.Close()
+			r.close()
 			delete(s.udp, t.PublicPort)
 		}
 	}
+	s.publishUDPSnapshotLocked()
 }
 
 func (s *relayServer) openTCP(a *agent, t proto.Mapping) error {
@@ -90,9 +93,10 @@ func (s *relayServer) openUDP(a *agent, t proto.Mapping) error {
 		return err
 	}
 
-	r := &udpRelay{port: t.PublicPort, agent: a, conn: conn, flows: map[string]*udpFlow{}, byID: map[uint64]*udpFlow{}}
+	r := &udpRelay{tunnel: t, agent: a, conn: conn, flows: map[netip.AddrPort]*udpFlow{}, byID: map[uint64]*udpFlow{}, done: make(chan struct{})}
 	s.udp[t.PublicPort] = r
 	go s.acceptUDP(r)
+	go r.pruneLoop()
 	return nil
 }
 
@@ -156,6 +160,10 @@ func relayTCP(r *tcpRelay, c net.Conn) {
 		st.CancelWrite(1)
 		return
 	}
+	if err := binary.Write(st, binary.BigEndian, r.tunnel.MappingID); err != nil {
+		st.CancelWrite(1)
+		return
+	}
 
 	done := make(chan struct{})
 	go func() {
@@ -181,7 +189,10 @@ func (s *relayServer) acceptUDP(r *udpRelay) {
 			return
 		}
 		flowID := r.flowID(a)
-		d, e := proto.MarshalUDPDatagram(r.port, flowID, b[:n])
+		if flowID == 0 {
+			continue
+		}
+		d, e := proto.MarshalUDPDatagram(r.tunnel.PublicPort, r.tunnel.MappingID, flowID, b[:n])
 		if e == nil {
 			_ = r.agent.conn.SendDatagram(d)
 		}
@@ -194,43 +205,65 @@ func (s *relayServer) fromAgentUDP(ctx context.Context, a *agent) {
 		if e != nil {
 			return
 		}
-		p, flowID, pay, e := proto.UnmarshalUDPDatagram(d)
+		p, mappingID, flowID, pay, e := proto.UnmarshalUDPDatagram(d)
 		if e != nil {
 			continue
 		}
-		s.mu.Lock()
-		r := s.udp[p]
-		s.mu.Unlock()
-		if r == nil || r.agent != a {
+		r := s.udpSnapshot.Load().(map[uint16]*udpRelay)[p]
+		if r == nil || r.agent != a || r.tunnel.MappingID != mappingID {
 			continue
 		}
 		r.mu.Lock()
-		r.pruneFlowsLocked()
 		flow := r.byID[flowID]
 		if flow != nil {
 			flow.lastSeen = time.Now()
 		}
 		r.mu.Unlock()
 		if flow != nil {
-			_, _ = r.conn.WriteToUDP(pay, flow.address)
+			_, _ = r.conn.WriteToUDP(pay, net.UDPAddrFromAddrPort(flow.address))
 		}
 	}
 }
 
 func (r *udpRelay) flowID(address *net.UDPAddr) uint64 {
-	key := address.String()
+	addr, ok := netip.AddrFromSlice(address.IP)
+	if !ok {
+		return 0
+	}
+	key := netip.AddrPortFrom(addr.Unmap(), uint16(address.Port))
 	r.mu.Lock()
 	defer r.mu.Unlock()
-	r.pruneFlowsLocked()
 	if flow := r.flows[key]; flow != nil {
 		flow.lastSeen = time.Now()
 		return flow.id
 	}
 
 	r.nextFlowID++
-	flow := &udpFlow{id: r.nextFlowID, address: address, lastSeen: time.Now()}
+	flow := &udpFlow{id: r.nextFlowID, address: key, lastSeen: time.Now()}
 	r.flows[key], r.byID[flow.id] = flow, flow
 	return flow.id
+}
+
+func (r *udpRelay) pruneLoop() {
+	ticker := time.NewTicker(30 * time.Second)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ticker.C:
+			r.mu.Lock()
+			r.pruneFlowsLocked()
+			r.mu.Unlock()
+		case <-r.done:
+			return
+		}
+	}
+}
+
+func (r *udpRelay) close() {
+	r.closeOnce.Do(func() {
+		close(r.done)
+		_ = r.conn.Close()
+	})
 }
 
 func (r *udpRelay) pruneFlowsLocked() {
@@ -253,12 +286,11 @@ func (s *relayServer) deleteTunnelForAgent(agentID, id string) (bool, error) {
 		if s.cfg.Agents[i].ID != agentID {
 			continue
 		}
-		for j, t := range s.cfg.Agents[i].Tunnels {
+		for _, t := range s.cfg.Agents[i].Tunnels {
 			if t.ID != id {
 				continue
 			}
 			tunnel, found = t, true
-			s.cfg.Agents[i].Tunnels = append(s.cfg.Agents[i].Tunnels[:j], s.cfg.Agents[i].Tunnels[j+1:]...)
 			break
 		}
 	}
@@ -266,27 +298,52 @@ func (s *relayServer) deleteTunnelForAgent(agentID, id string) (bool, error) {
 		s.mu.Unlock()
 		return false, nil
 	}
+	a := s.agents[agentID]
+	s.mu.Unlock()
+	if a == nil {
+		return true, fmt.Errorf("agent is not connected")
+	}
+	if err := a.sendAndWaitAck(proto.Message{Type: proto.MsgTunnelRemove, TunnelID: id}); err != nil {
+		return true, fmt.Errorf("agent did not acknowledge deletion: %w", err)
+	}
+	s.mu.Lock()
+	s.removeTunnelConfigLocked(agentID, id)
+	s.mu.Unlock()
+	if err := s.saveData(); err != nil {
+		s.mu.Lock()
+		for i := range s.cfg.Agents {
+			if s.cfg.Agents[i].ID == agentID {
+				s.cfg.Agents[i].Tunnels = append(s.cfg.Agents[i].Tunnels, tunnel)
+				s.reservedPorts[tunnel.PublicPort] = struct{}{}
+				break
+			}
+		}
+		s.mu.Unlock()
+		if rollbackErr := a.sendAndWaitAck(proto.Message{Type: proto.MsgTunnelAdd, Tunnel: &tunnel, TunnelID: id}); rollbackErr != nil {
+			logging.Event("!", "restore tunnel %s after save failure: %v", id, rollbackErr)
+			s.disconnectAgent(a, "tunnel restore failed")
+		}
+		return true, err
+	}
+	s.mu.Lock()
 	if r := s.tcp[tunnel.PublicPort]; r != nil {
 		r.close()
 		delete(s.tcp, tunnel.PublicPort)
 	}
 	if r := s.udp[tunnel.PublicPort]; r != nil {
-		_ = r.conn.Close()
+		r.close()
 		delete(s.udp, tunnel.PublicPort)
 	}
-	if a := s.agents[agentID]; a != nil {
-		_ = a.send(proto.Message{Type: proto.MsgTunnelRemove, TunnelID: id})
-	}
+	s.publishUDPSnapshotLocked()
 	s.mu.Unlock()
-	if err := s.saveData(); err != nil {
-		return true, err
-	}
 	logging.Event("-", "tunnel %s deleted from %s: %s %d -> %s", id, agentID, tunnel.Network, tunnel.PublicPort, tunnel.TargetAddr)
 	return true, nil
 }
 
 func (s *relayServer) removeLocked(a *agent) {
-	delete(s.agents, a.id)
+	if s.agents[a.id] == a {
+		delete(s.agents, a.id)
+	}
 
 	for p, r := range s.tcp {
 		if r.agent == a {
@@ -296,8 +353,17 @@ func (s *relayServer) removeLocked(a *agent) {
 	}
 	for p, r := range s.udp {
 		if r.agent == a {
-			_ = r.conn.Close()
+			r.close()
 			delete(s.udp, p)
 		}
 	}
+	s.publishUDPSnapshotLocked()
+}
+
+func (s *relayServer) publishUDPSnapshotLocked() {
+	snapshot := make(map[uint16]*udpRelay, len(s.udp))
+	for port, relay := range s.udp {
+		snapshot[port] = relay
+	}
+	s.udpSnapshot.Store(snapshot)
 }
