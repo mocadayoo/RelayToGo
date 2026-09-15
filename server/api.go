@@ -7,74 +7,11 @@ import (
 	"fmt"
 	"math/big"
 	"net"
-	"net/http"
 	"os"
 	"strings"
 
 	proto "RelayToGo/protocol"
 )
-
-type tunnelRequest struct {
-	AgentID string `json:"agent_id"`
-	proto.Mapping
-}
-
-func (s *relayServer) serveAPI(address string) {
-	mux := http.NewServeMux()
-	mux.HandleFunc("/api/tunnels", s.tunnelsAPI)
-	mux.HandleFunc("/api/tunnels/", s.tunnelAPI)
-	_ = http.ListenAndServe(address, s.apiAuth(mux))
-}
-func (s *relayServer) tunnelAPI(w http.ResponseWriter, r *http.Request) {
-	if r.Method != http.MethodDelete {
-		http.Error(w, "method not allowed", 405)
-		return
-	}
-	id := strings.TrimPrefix(r.URL.Path, "/api/tunnels/")
-	if deleted, err := s.deleteTunnel(id); err != nil {
-		http.Error(w, err.Error(), http.StatusInternalServerError)
-		return
-	} else if deleted {
-		w.WriteHeader(http.StatusNoContent)
-		return
-	}
-	http.NotFound(w, r)
-}
-
-func (s *relayServer) apiAuth(next http.Handler) http.Handler {
-	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if s.cfg.APIToken != "" && r.Header.Get("Authorization") != "Bearer "+s.cfg.APIToken {
-			http.Error(w, "unauthorized", 401)
-			return
-		}
-		next.ServeHTTP(w, r)
-	})
-}
-
-func (s *relayServer) tunnelsAPI(w http.ResponseWriter, r *http.Request) {
-	switch r.Method {
-	case http.MethodGet:
-		s.mu.Lock()
-		defer s.mu.Unlock()
-		_ = json.NewEncoder(w).Encode(s.cfg.Agents)
-	case http.MethodPost:
-		var request tunnelRequest
-		if err := json.NewDecoder(r.Body).Decode(&request); err != nil {
-			http.Error(w, err.Error(), 400)
-			return
-		}
-		tunnel, err := s.createTunnel(request.AgentID, request.Mapping)
-		if err != nil {
-			http.Error(w, err.Error(), 409)
-			return
-		}
-		request.Mapping = tunnel
-		w.WriteHeader(http.StatusCreated)
-		_ = json.NewEncoder(w).Encode(request)
-	default:
-		http.Error(w, "method not allowed", 405)
-	}
-}
 
 func (s *relayServer) createTunnel(agentID string, tunnel proto.Mapping) (proto.Mapping, error) {
 	if tunnel.ID == "" {

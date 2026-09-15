@@ -23,8 +23,6 @@ import (
 type config struct {
 	QUICAddr        string        `json:"quic_addr"`
 	PublicAddr      string        `json:"public_addr"`
-	APIAddr         string        `json:"api_addr"`
-	APIToken        string        `json:"api_token"`
 	PublicPortRange portRange     `json:"public_port_range"`
 	Agents          []agentConfig `json:"agents"`
 }
@@ -93,7 +91,6 @@ type relayServer struct {
 
 func main() {
 	path := flag.String("config", "server/config.json", "server configuration")
-	api := flag.String("api", "127.0.0.1:41001", "management API address")
 	flag.Parse()
 	cfg, err := loadConfig(*path)
 	if err != nil {
@@ -134,10 +131,6 @@ func main() {
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 
-	if cfg.APIAddr == "" {
-		cfg.APIAddr = *api
-	}
-	go s.serveAPI(cfg.APIAddr)
 	go s.readConsole(ctx.Done())
 	for {
 		conn, err := ln.Accept(ctx)

@@ -208,21 +208,6 @@ func (r *udpRelay) pruneFlowsLocked() {
 
 func (s *relayServer) remove(a *agent) { s.mu.Lock(); defer s.mu.Unlock(); s.removeLocked(a) }
 
-func (s *relayServer) deleteTunnel(id string) (bool, error) {
-	s.mu.Lock()
-	for i := range s.cfg.Agents {
-		for _, t := range s.cfg.Agents[i].Tunnels {
-			if t.ID == id {
-				agentID := s.cfg.Agents[i].ID
-				s.mu.Unlock()
-				return s.deleteTunnelForAgent(agentID, id)
-			}
-		}
-	}
-	s.mu.Unlock()
-	return false, nil
-}
-
 func (s *relayServer) deleteTunnelForAgent(agentID, id string) (bool, error) {
 	s.mu.Lock()
 	var tunnel proto.Mapping
