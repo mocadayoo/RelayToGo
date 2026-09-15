@@ -70,6 +70,7 @@ func (s *relayServer) addAgent(id, fingerprint string) {
 	}
 	s.cfg.Agents = append(s.cfg.Agents, agentConfig{ID: id, PublicKeySHA256: fingerprint})
 	if err := s.saveAgentSecretsLocked(); err != nil {
+		s.cfg.Agents = s.cfg.Agents[:len(s.cfg.Agents)-1]
 		log.Printf("save agents: %v", err)
 		return
 	}
@@ -87,8 +88,12 @@ func (s *relayServer) removeAgent(id string) {
 			log.Print("remove this agent's tunnels and disconnect it first")
 			return
 		}
+		removed := s.cfg.Agents[i]
 		s.cfg.Agents = append(s.cfg.Agents[:i], s.cfg.Agents[i+1:]...)
 		if err := s.saveAgentSecretsLocked(); err != nil {
+			s.cfg.Agents = append(s.cfg.Agents, agentConfig{})
+			copy(s.cfg.Agents[i+1:], s.cfg.Agents[i:])
+			s.cfg.Agents[i] = removed
 			log.Printf("save agents: %v", err)
 			return
 		}

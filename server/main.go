@@ -237,7 +237,8 @@ func validateAgentSecrets(agents []agentConfig) error {
 		}
 		ids[a.ID] = true
 	}
-	return nil
+	_, err := agentKeyIndex(agents)
+	return err
 }
 
 func loadTunnelData(path string, c *config) error {
@@ -281,10 +282,15 @@ func loadTunnelData(path string, c *config) error {
 
 func validateConfiguredTunnels(c config) error {
 	tcp, udp := map[uint16]bool{}, map[uint16]bool{}
+	mappingIDs := map[uint64]bool{}
 	for _, a := range c.Agents {
 		tunnelNames := map[string]bool{}
 		tunnelIDs := map[string]bool{}
 		for _, t := range a.Tunnels {
+			if t.MappingID == 0 || mappingIDs[t.MappingID] {
+				return fmt.Errorf("mapping IDs must be non-zero and globally unique")
+			}
+			mappingIDs[t.MappingID] = true
 			if t.ID == "" || tunnelIDs[t.ID] {
 				return fmt.Errorf("agent %s tunnel IDs must be unique", a.ID)
 			}

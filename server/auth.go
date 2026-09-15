@@ -21,7 +21,7 @@ func agentKeyIndex(agents []agentConfig) (map[string]string, error) {
 	keys := make(map[string]string, len(agents))
 	for _, agent := range agents {
 		if agent.PublicKeySHA256 == "" {
-			continue
+			return nil, fmt.Errorf("agent %s has a missing public_key_sha256", agent.ID)
 		}
 		if len(agent.PublicKeySHA256) != sha256.Size*2 {
 			return nil, fmt.Errorf("agent %s has an invalid public_key_sha256", agent.ID)
