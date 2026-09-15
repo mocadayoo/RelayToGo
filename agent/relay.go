@@ -13,10 +13,13 @@ import (
 	"github.com/quic-go/quic-go"
 )
 
+const relaySetupTimeout = 10 * time.Second
+
 var udpBuffers = sync.Pool{New: func() any { return make([]byte, 65535) }}
 
 func (a *relayAgent) handleTCP(st *quic.Stream) {
 	defer st.Close()
+	_ = st.SetReadDeadline(time.Now().Add(relaySetupTimeout))
 	var p uint16
 	if err := binary.Read(st, binary.BigEndian, &p); err != nil {
 		return
@@ -25,13 +28,16 @@ func (a *relayAgent) handleTCP(st *quic.Stream) {
 	if err := binary.Read(st, binary.BigEndian, &mappingID); err != nil {
 		return
 	}
+	_ = st.SetReadDeadline(time.Time{})
 
 	target, stats := a.tcpTargetAndStats(p, mappingID)
 	if target == "" || stats == nil {
 		return
 	}
 
-	local, err := net.Dial("tcp", target)
+	dialCtx, cancel := context.WithTimeout(context.Background(), relaySetupTimeout)
+	defer cancel()
+	local, err := (&net.Dialer{}).DialContext(dialCtx, "tcp", target)
 	if err != nil {
 		st.CancelRead(1)
 		st.CancelWrite(1)

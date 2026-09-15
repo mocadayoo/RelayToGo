@@ -13,6 +13,8 @@ import (
 	proto "RelayToGo/protocol"
 )
 
+const relaySetupTimeout = 10 * time.Second
+
 func (s *relayServer) register(a *agent, ts []proto.Mapping) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -160,12 +162,15 @@ func relayTCP(r *tcpRelay, c net.Conn) {
 	defer logging.Event("-", "client %s disconnected from tunnel %s", client, r.tunnel.ID)
 	defer r.removeConn(c)
 	defer c.Close()
-	st, e := r.agent.conn.OpenStreamSync(context.Background())
+	openCtx, cancel := context.WithTimeout(context.Background(), relaySetupTimeout)
+	defer cancel()
+	st, e := r.agent.conn.OpenStreamSync(openCtx)
 	if e != nil {
 		return
 	}
 
 	defer st.Close()
+	_ = st.SetWriteDeadline(time.Now().Add(relaySetupTimeout))
 	if err := binary.Write(st, binary.BigEndian, r.tunnel.PublicPort); err != nil {
 		st.CancelWrite(1)
 		return
@@ -174,6 +179,7 @@ func relayTCP(r *tcpRelay, c net.Conn) {
 		st.CancelWrite(1)
 		return
 	}
+	_ = st.SetWriteDeadline(time.Time{})
 
 	done := make(chan struct{})
 	go func() {
@@ -186,6 +192,8 @@ func relayTCP(r *tcpRelay, c net.Conn) {
 	}()
 	if _, err := io.Copy(c, st); err != nil {
 		st.CancelRead(1)
+	} else if tcp, ok := c.(*net.TCPConn); ok {
+		_ = tcp.CloseWrite()
 	}
 
 	<-done
