@@ -3,12 +3,14 @@ package main
 import (
 	"context"
 	"encoding/binary"
+	"errors"
 	"io"
 	"net"
 	"sync"
 	"time"
 
 	proto "RelayToGo/protocol"
+	"RelayToGo/internal/logging"
 
 	"github.com/quic-go/quic-go"
 )
@@ -161,7 +163,24 @@ func (a *relayAgent) fromLocalUDP(key udpSessionKey, s *udpSession) {
 		d, e := proto.MarshalUDPDatagram(s.port, s.mappingID, s.flowID, b[:n])
 		if e == nil {
 			s.stats.addOut(n)
-			_ = a.conn.SendDatagram(d)
+			a.sendUDPDatagram(s, d)
+		}
+	}
+}
+
+func (a *relayAgent) sendUDPDatagram(s *udpSession, datagram []byte) {
+	if maximum := a.maxDatagramSize.Load(); maximum > 0 && int64(len(datagram)) > maximum {
+		s.stats.addDrop()
+		return
+	}
+	if err := a.conn.SendDatagram(datagram); err != nil {
+		var tooLarge *quic.DatagramTooLargeError
+		if errors.As(err, &tooLarge) {
+			a.maxDatagramSize.Store(tooLarge.MaxDatagramPayloadSize)
+		}
+		count := s.stats.addDrop()
+		if count == 1 || count&(count-1) == 0 {
+			logging.Event("!", "UDP datagram dropped for tunnel port %d (%v; total=%d)", s.port, err, count)
 		}
 	}
 }

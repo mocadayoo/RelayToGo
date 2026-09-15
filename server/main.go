@@ -63,6 +63,7 @@ type agent struct {
 	mu         sync.Mutex
 	operations chan proto.Message
 	closeOnce  sync.Once
+	maxDatagramSize atomic.Int64
 }
 
 type tcpRelay struct {
@@ -84,6 +85,7 @@ type udpRelay struct {
 	byID       map[uint64]*udpFlow
 	done       chan struct{}
 	closeOnce  sync.Once
+	dropped    atomic.Uint64
 }
 
 type udpFlow struct {

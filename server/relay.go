@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"encoding/binary"
+	"errors"
 	"fmt"
 	"io"
 	"net"
@@ -11,6 +12,8 @@ import (
 
 	"RelayToGo/internal/logging"
 	proto "RelayToGo/protocol"
+
+	"github.com/quic-go/quic-go"
 )
 
 const relaySetupTimeout = 10 * time.Second
@@ -212,8 +215,32 @@ func (s *relayServer) acceptUDP(r *udpRelay) {
 		}
 		d, e := proto.MarshalUDPDatagram(r.tunnel.PublicPort, r.tunnel.MappingID, flowID, b[:n])
 		if e == nil {
-			_ = r.agent.conn.SendDatagram(d)
+			r.sendDatagram(d)
 		}
+	}
+}
+
+func (r *udpRelay) sendDatagram(datagram []byte) {
+	if maximum := r.agent.maxDatagramSize.Load(); maximum > 0 && int64(len(datagram)) > maximum {
+		r.recordDrop("exceeds negotiated QUIC datagram size")
+		return
+	}
+	if err := r.agent.conn.SendDatagram(datagram); err != nil {
+		var tooLarge *quic.DatagramTooLargeError
+		if errors.As(err, &tooLarge) {
+			r.agent.maxDatagramSize.Store(tooLarge.MaxDatagramPayloadSize)
+			r.recordDrop("exceeds negotiated QUIC datagram size")
+			return
+		}
+		r.recordDrop("QUIC datagram send failed")
+	}
+}
+
+func (r *udpRelay) recordDrop(reason string) {
+	count := r.dropped.Add(1)
+	// Log at powers of two: observable without turning a packet flood into a log flood.
+	if count == 1 || count&(count-1) == 0 {
+		logging.Event("!", "UDP datagram dropped for tunnel %s (%s; total=%d)", r.tunnel.ID, reason, count)
 	}
 }
 

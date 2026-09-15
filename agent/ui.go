@@ -21,6 +21,7 @@ type tunnelView struct {
 	proto.Mapping
 	In      uint64 `json:"in"`
 	Out     uint64 `json:"out"`
+	Drops   uint64 `json:"drops"`
 	Clients int    `json:"clients"`
 }
 
@@ -97,11 +98,12 @@ func (a *relayAgent) tunnelViews() []tunnelView {
 	for _, tunnel := range a.tunnels {
 		stats := a.stats[tunnelKey(tunnel.Network, tunnel.PublicPort)]
 		var in, out uint64
+		var drops uint64
 		var clients int
 		if stats != nil {
-			in, out, clients = stats.snapshot()
+			in, out, drops, clients = stats.snapshot()
 		}
-		views = append(views, tunnelView{Mapping: tunnel, In: in, Out: out, Clients: clients})
+		views = append(views, tunnelView{Mapping: tunnel, In: in, Out: out, Drops: drops, Clients: clients})
 	}
 	return views
 }

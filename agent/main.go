@@ -47,6 +47,7 @@ type relayAgent struct {
 	pending         map[string]chan proto.Message
 	requestSeq      atomic.Uint64
 	lastPong        atomic.Int64
+	maxDatagramSize atomic.Int64
 }
 
 func main() {
