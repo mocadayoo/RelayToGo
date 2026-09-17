@@ -55,29 +55,37 @@ type agentTunnelData struct {
 }
 
 type agent struct {
-	id         string
-	conn       *quic.Conn
-	outbound   chan proto.Message
-	done       chan struct{}
-	acks       map[string]chan proto.Message
-	mu         sync.Mutex
-	operations chan proto.Message
-	closeOnce  sync.Once
+	id              string
+	conn            *quic.Conn
+	outbound        chan proto.Message
+	done            chan struct{}
+	acks            map[string]chan proto.Message
+	mu              sync.Mutex
+	operations      chan proto.Message
+	closeOnce       sync.Once
 	maxDatagramSize atomic.Int64
 }
 
 type tcpRelay struct {
-	tunnel proto.Mapping
-	agent  *agent
-	ln     net.Listener
-	mu     sync.Mutex
-	conns  map[net.Conn]struct{}
-	closed bool
+	tunnel    proto.Mapping
+	agent     *agent
+	guard     *tunnelProtector
+	ln        net.Listener
+	mu        sync.Mutex
+	conns     map[net.Conn]*tcpClient
+	done      chan struct{}
+	closeOnce sync.Once
+	closed    bool
+}
+
+type tcpClient struct {
+	lastActivity atomic.Int64
 }
 
 type udpRelay struct {
 	tunnel     proto.Mapping
 	agent      *agent
+	guard      *tunnelProtector
 	conn       *net.UDPConn
 	mu         sync.Mutex
 	nextFlowID uint64
@@ -85,6 +93,7 @@ type udpRelay struct {
 	byID       map[uint64]*udpFlow
 	done       chan struct{}
 	closeOnce  sync.Once
+	closed     bool
 	dropped    atomic.Uint64
 }
 
@@ -100,17 +109,17 @@ type portReservation struct {
 }
 
 type relayServer struct {
-	mu            sync.Mutex
-	cfg           config
-	agentsPath    string
-	dataPath      string
-	agents        map[string]*agent
-	tcp           map[uint16]*tcpRelay
-	udp           map[uint16]*udpRelay
-	udpSnapshot   atomic.Value
-	// reservedPorts tracks persisted mappings by transport protocol. TCP and UDP
-	// intentionally share a numeric port when their respective reservations allow it.
+	mu          sync.Mutex
+	cfg         config
+	agentsPath  string
+	dataPath    string
+	agents      map[string]*agent
+	tcp         map[uint16]*tcpRelay
+	udp         map[uint16]*udpRelay
+	udpSnapshot atomic.Value
+
 	reservedPorts map[uint16]portReservation
+	protector     *protector
 }
 
 func main() {
@@ -129,7 +138,7 @@ func main() {
 	if err := loadTunnelData(dataPath, &cfg); err != nil {
 		log.Fatal(err)
 	}
-	s := &relayServer{cfg: cfg, agentsPath: filepath.Join(secretDir, "agents.json"), dataPath: dataPath, agents: map[string]*agent{}, tcp: map[uint16]*tcpRelay{}, udp: map[uint16]*udpRelay{}, reservedPorts: map[uint16]portReservation{}}
+	s := &relayServer{cfg: cfg, agentsPath: filepath.Join(secretDir, "agents.json"), dataPath: dataPath, agents: map[string]*agent{}, tcp: map[uint16]*tcpRelay{}, udp: map[uint16]*udpRelay{}, reservedPorts: map[uint16]portReservation{}, protector: newProtector()}
 	for _, agent := range cfg.Agents {
 		for _, tunnel := range agent.Tunnels {
 			s.reserveTunnelLocked(tunnel)
@@ -151,9 +160,18 @@ func main() {
 	if err != nil {
 		log.Fatal(err)
 	}
-
 	defer sock.Close()
-	ln, err := quic.Listen(sock, tlsConf, &quic.Config{EnableDatagrams: true})
+
+	transport := &quic.Transport{
+		Conn:                sock,
+		VerifySourceAddress: s.protector.verifySourceAddress,
+	}
+	defer transport.Close()
+	ln, err := transport.Listen(tlsConf, &quic.Config{
+		EnableDatagrams:       true,
+		MaxIncomingStreams:    1,
+		MaxIncomingUniStreams: -1,
+	})
 	if err != nil {
 		log.Fatal(err)
 	}
@@ -162,6 +180,7 @@ func main() {
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 
+	go s.protector.run(ctx)
 	go s.readConsole(ctx.Done())
 	for {
 		conn, err := ln.Accept(ctx)

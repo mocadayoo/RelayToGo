@@ -8,6 +8,7 @@ import (
 	"io"
 	"net"
 	"net/netip"
+	"sync/atomic"
 	"time"
 
 	"RelayToGo/internal/logging"
@@ -40,23 +41,29 @@ func (s *relayServer) register(a *agent, ts []proto.Mapping) error {
 		}
 	}
 	for _, t := range ts {
+		guard := s.protector.newTunnel(t.Network)
 		switch t.Network {
 		case proto.NetworkTCP:
-			if err := s.openTCP(a, t); err != nil {
+			if err := s.openTCP(a, t, guard); err != nil {
+				guard.releaseRelay()
 				s.rollbackMappingsLocked(a, ts)
 				return err
 			}
 		case proto.NetworkUDP:
-			if err := s.openUDP(a, t); err != nil {
+			if err := s.openUDP(a, t, guard); err != nil {
+				guard.releaseRelay()
 				s.rollbackMappingsLocked(a, ts)
 				return err
 			}
 		case proto.NetworkBoth:
-			if err := s.openTCP(a, t); err != nil {
+			if err := s.openTCP(a, t, guard); err != nil {
+				guard.releaseRelay()
+				guard.releaseRelay()
 				s.rollbackMappingsLocked(a, ts)
 				return err
 			}
-			if err := s.openUDP(a, t); err != nil {
+			if err := s.openUDP(a, t, guard); err != nil {
+				guard.releaseRelay()
 				s.rollbackMappingsLocked(a, ts)
 				return err
 			}
@@ -90,25 +97,26 @@ func matchingUDPRelay(r *udpRelay, a *agent, mappingID uint64) bool {
 	return r != nil && r.agent == a && r.tunnel.MappingID == mappingID
 }
 
-func (s *relayServer) openTCP(a *agent, t proto.Mapping) error {
+func (s *relayServer) openTCP(a *agent, t proto.Mapping, guard *tunnelProtector) error {
 	ln, err := net.Listen("tcp", fmt.Sprintf(":%d", t.PublicPort))
 	if err != nil {
 		return err
 	}
 
-	r := &tcpRelay{tunnel: t, agent: a, ln: ln, conns: map[net.Conn]struct{}{}}
+	r := &tcpRelay{tunnel: t, agent: a, guard: guard, ln: ln, conns: map[net.Conn]*tcpClient{}, done: make(chan struct{})}
 	s.tcp[t.PublicPort] = r
 	go s.acceptTCP(r)
+	go r.pruneLoop()
 	return nil
 }
 
-func (s *relayServer) openUDP(a *agent, t proto.Mapping) error {
+func (s *relayServer) openUDP(a *agent, t proto.Mapping, guard *tunnelProtector) error {
 	conn, err := net.ListenUDP("udp", &net.UDPAddr{Port: int(t.PublicPort)})
 	if err != nil {
 		return err
 	}
 
-	r := &udpRelay{tunnel: t, agent: a, conn: conn, flows: map[netip.AddrPort]*udpFlow{}, byID: map[uint64]*udpFlow{}, done: make(chan struct{})}
+	r := &udpRelay{tunnel: t, agent: a, guard: guard, conn: conn, flows: map[netip.AddrPort]*udpFlow{}, byID: map[uint64]*udpFlow{}, done: make(chan struct{})}
 	s.udp[t.PublicPort] = r
 	go s.acceptUDP(r)
 	go r.pruneLoop()
@@ -121,48 +129,63 @@ func (s *relayServer) acceptTCP(r *tcpRelay) {
 		if e != nil {
 			return
 		}
-		if !r.addConn(c) {
+		client := r.addConn(c)
+		if client == nil {
 			_ = c.Close()
 			continue
 		}
-		logging.Event("+", "client %s connected to tunnel %s", c.RemoteAddr(), r.tunnel.ID)
-		go relayTCP(r, c)
+		logLifecycle := r.guard.allowTCPLog()
+		if logLifecycle {
+			logging.Event("+", "client %s connected to tunnel %s", c.RemoteAddr(), r.tunnel.ID)
+		}
+		go relayTCP(r, c, client)
 	}
 }
 
-func (r *tcpRelay) addConn(c net.Conn) bool {
+func (r *tcpRelay) addConn(c net.Conn) *tcpClient {
+	if !r.guard.acquireTCP() {
+		return nil
+	}
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	if r.closed {
-		return false
+		r.guard.releaseTCP()
+		return nil
 	}
-	r.conns[c] = struct{}{}
-	return true
+	client := &tcpClient{}
+	client.lastActivity.Store(time.Now().UnixNano())
+	r.conns[c] = client
+	return client
 }
 
 func (r *tcpRelay) removeConn(c net.Conn) {
 	r.mu.Lock()
 	delete(r.conns, c)
 	r.mu.Unlock()
+	r.guard.releaseTCP()
 }
 
 func (r *tcpRelay) close() {
-	r.mu.Lock()
-	if r.closed {
+	r.closeOnce.Do(func() {
+		r.mu.Lock()
+		r.closed = true
+		close(r.done)
+		_ = r.ln.Close()
+		for c := range r.conns {
+			_ = c.Close()
+		}
 		r.mu.Unlock()
-		return
-	}
-	r.closed = true
-	_ = r.ln.Close()
-	for c := range r.conns {
-		_ = c.Close()
-	}
-	r.mu.Unlock()
+		r.guard.releaseRelay()
+	})
 }
 
-func relayTCP(r *tcpRelay, c net.Conn) {
-	client := c.RemoteAddr().String()
-	defer logging.Event("-", "client %s disconnected from tunnel %s", client, r.tunnel.ID)
+func relayTCP(r *tcpRelay, c net.Conn, client *tcpClient) {
+	remote := c.RemoteAddr().String()
+	defer func() {
+		if r.guard.allowTCPLog() {
+			logging.Event("-", "client %s disconnected from tunnel %s", remote, r.tunnel.ID)
+		}
+	}()
 	defer r.removeConn(c)
 	defer c.Close()
 	openCtx, cancel := context.WithTimeout(context.Background(), relaySetupTimeout)
@@ -186,20 +209,44 @@ func relayTCP(r *tcpRelay, c net.Conn) {
 
 	done := make(chan struct{})
 	go func() {
-		if _, err := io.Copy(st, c); err != nil {
+		if _, err := io.Copy(st, &protectedReader{source: c, guard: r.guard, direction: trafficToAgent, done: r.done, activity: &client.lastActivity}); err != nil {
 			st.CancelWrite(1)
 		} else {
 			_ = st.Close()
 		}
 		close(done)
 	}()
-	if _, err := io.Copy(c, st); err != nil {
+	if _, err := io.Copy(c, &protectedReader{source: st, guard: r.guard, direction: trafficFromAgent, done: r.done, activity: &client.lastActivity}); err != nil {
 		st.CancelRead(1)
 	} else if tcp, ok := c.(*net.TCPConn); ok {
 		_ = tcp.CloseWrite()
 	}
 
 	<-done
+}
+
+func (r *tcpRelay) pruneLoop() {
+	ticker := time.NewTicker(5 * time.Second)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ticker.C:
+			deadline := time.Now().Add(-r.guard.tcpIdleTimeout()).UnixNano()
+			var stale []net.Conn
+			r.mu.Lock()
+			for conn, client := range r.conns {
+				if client.lastActivity.Load() < deadline {
+					stale = append(stale, conn)
+				}
+			}
+			r.mu.Unlock()
+			for _, conn := range stale {
+				_ = conn.Close()
+			}
+		case <-r.done:
+			return
+		}
+	}
 }
 
 func (s *relayServer) acceptUDP(r *udpRelay) {
@@ -209,6 +256,15 @@ func (s *relayServer) acceptUDP(r *udpRelay) {
 		if e != nil {
 			return
 		}
+		if maximum := r.agent.maxDatagramSize.Load(); maximum > 0 && int64(n+proto.UDPDatagramHeaderSize) > maximum {
+			r.recordDrop("exceeds negotiated QUIC datagram size")
+			continue
+		}
+		if !r.guard.allowDatagram(trafficToAgent, n) {
+			r.recordDrop("protector inbound packet/byte budget exhausted")
+			continue
+		}
+
 		flowID := r.flowID(a)
 		if flowID == 0 {
 			continue
@@ -238,7 +294,7 @@ func (r *udpRelay) sendDatagram(datagram []byte) {
 
 func (r *udpRelay) recordDrop(reason string) {
 	count := r.dropped.Add(1)
-	// Log at powers of two: observable without turning a packet flood into a log flood.
+
 	if count == 1 || count&(count-1) == 0 {
 		logging.Event("!", "UDP datagram dropped for tunnel %s (%s; total=%d)", r.tunnel.ID, reason, count)
 	}
@@ -260,6 +316,17 @@ func (s *relayServer) fromAgentUDP(ctx context.Context, a *agent) {
 		}
 		r.mu.Lock()
 		flow := r.byID[flowID]
+		r.mu.Unlock()
+		if flow == nil {
+			continue
+		}
+		if !r.guard.allowDatagram(trafficFromAgent, len(pay)) {
+			r.recordDrop("protector outbound packet/byte budget exhausted")
+			continue
+		}
+
+		r.mu.Lock()
+		flow = r.byID[flowID]
 		if flow != nil {
 			flow.lastSeen = time.Now()
 		}
@@ -278,9 +345,16 @@ func (r *udpRelay) flowID(address *net.UDPAddr) uint64 {
 	key := netip.AddrPortFrom(addr.Unmap(), uint16(address.Port))
 	r.mu.Lock()
 	defer r.mu.Unlock()
+	if r.closed {
+		return 0
+	}
 	if flow := r.flows[key]; flow != nil {
 		flow.lastSeen = time.Now()
 		return flow.id
+	}
+	if !r.guard.acquireUDP() {
+		r.recordDrop("protector flow admission denied")
+		return 0
 	}
 
 	r.nextFlowID++
@@ -290,7 +364,7 @@ func (r *udpRelay) flowID(address *net.UDPAddr) uint64 {
 }
 
 func (r *udpRelay) pruneLoop() {
-	ticker := time.NewTicker(30 * time.Second)
+	ticker := time.NewTicker(5 * time.Second)
 	defer ticker.Stop()
 	for {
 		select {
@@ -306,19 +380,49 @@ func (r *udpRelay) pruneLoop() {
 
 func (r *udpRelay) close() {
 	r.closeOnce.Do(func() {
+		r.mu.Lock()
+		r.closed = true
+		flows := len(r.flows)
+		r.flows = make(map[netip.AddrPort]*udpFlow)
+		r.byID = make(map[uint64]*udpFlow)
+		r.mu.Unlock()
 		close(r.done)
 		_ = r.conn.Close()
+		for range flows {
+			r.guard.releaseUDP()
+		}
+		r.guard.releaseRelay()
 	})
 }
 
 func (r *udpRelay) pruneFlowsLocked() {
-	deadline := time.Now().Add(-2 * time.Minute)
+	deadline := time.Now().Add(-r.guard.udpIdleTimeout())
 	for key, flow := range r.flows {
 		if flow.lastSeen.Before(deadline) {
 			delete(r.flows, key)
 			delete(r.byID, flow.id)
+			r.guard.releaseUDP()
 		}
 	}
+}
+
+type protectedReader struct {
+	source    io.Reader
+	guard     *tunnelProtector
+	direction trafficDirection
+	done      <-chan struct{}
+	activity  *atomic.Int64
+}
+
+func (r *protectedReader) Read(buffer []byte) (int, error) {
+	n, err := r.source.Read(buffer)
+	if n > 0 && r.activity != nil {
+		r.activity.Store(time.Now().UnixNano())
+	}
+	if n > 0 && !r.guard.waitBytes(r.done, r.direction, n) {
+		return 0, io.ErrClosedPipe
+	}
+	return n, err
 }
 
 func (s *relayServer) remove(a *agent) { s.mu.Lock(); defer s.mu.Unlock(); s.removeLocked(a) }
@@ -349,8 +453,6 @@ func (s *relayServer) deleteTunnelForAgent(agentID, id string) (bool, error) {
 		return true, fmt.Errorf("agent is not connected")
 	}
 	if err := a.sendAndWaitAck(proto.Message{Type: proto.MsgTunnelRemove, TunnelID: id}); err != nil {
-		// The agent may have applied the deletion before its ACK became unavailable.
-		// Keep the persisted desired state and force a reconnect, which replays it.
 		s.disconnectAgent(a, "tunnel deletion acknowledgement failed")
 		return true, fmt.Errorf("agent did not acknowledge deletion: %w", err)
 	}

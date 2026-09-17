@@ -51,17 +51,19 @@ type Message struct {
 	Reason          string      `json:"reason,omitempty"`
 }
 
+const UDPDatagramHeaderSize = 18
+
 func MarshalUDPDatagram(port uint16, mappingID, flowID uint64, payload []byte) ([]byte, error) {
-	packet := make([]byte, 18+len(payload))
+	packet := make([]byte, UDPDatagramHeaderSize+len(payload))
 	binary.BigEndian.PutUint16(packet[:2], port)
 	binary.BigEndian.PutUint64(packet[2:10], mappingID)
 	binary.BigEndian.PutUint64(packet[10:18], flowID)
-	copy(packet[18:], payload)
+	copy(packet[UDPDatagramHeaderSize:], payload)
 	return packet, nil
 }
 
 func UnmarshalUDPDatagram(packet []byte) (port uint16, mappingID, flowID uint64, payload []byte, err error) {
-	if len(packet) < 18 {
+	if len(packet) < UDPDatagramHeaderSize {
 		err = fmt.Errorf("UDP datagram header is truncated")
 		return
 	}
@@ -69,6 +71,6 @@ func UnmarshalUDPDatagram(packet []byte) (port uint16, mappingID, flowID uint64,
 	port = binary.BigEndian.Uint16(packet[:2])
 	mappingID = binary.BigEndian.Uint64(packet[2:10])
 	flowID = binary.BigEndian.Uint64(packet[10:18])
-	payload = packet[18:]
+	payload = packet[UDPDatagramHeaderSize:]
 	return
 }
