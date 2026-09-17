@@ -66,7 +66,7 @@ func main() {
 
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
-	q, err := quic.DialAddr(ctx, *server, tlsConfig, &quic.Config{EnableDatagrams: true})
+	q, err := quic.DialAddr(ctx, *server, tlsConfig, &quic.Config{EnableDatagrams: true, MaxIncomingStreams: (1 << 31) - 1})
 	if err != nil {
 		log.Fatal(err)
 	}
